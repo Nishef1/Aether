@@ -30,7 +30,9 @@ Obfuscation:
   --noize <profile>        obfuscation profile (off, light/firewall, balanced, gfw/aggressive, ...)
 
 MASQUE transport:
-  --h2, --http2            use HTTP/2 (TCP) instead of HTTP/3 (QUIC)
+  --masque-transport <m>   auto | h3 | h2 (explicit modes never prompt)
+  --h3, --http3, --quic    force HTTP/3 (QUIC), skip transport prompt
+  --h2, --http2            force HTTP/2 (TCP), skip transport prompt
   --h2-peer <ip:port>      override the peer used for the HTTP/2 transport
   --ech <auto|base64>      enable Encrypted Client Hello
   --no-data-check          skip the end-to-end data-plane validation
@@ -62,6 +64,24 @@ Advanced:
   -v, --version            show version and exit
   -h, --help               show this help and exit
 ";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasqueTransportChoice {
+    Auto,
+    Http3,
+    Http2,
+}
+
+impl MasqueTransportChoice {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "h3" | "http3" | "quic" => Some(Self::Http3),
+            "h2" | "http2" => Some(Self::Http2),
+            _ => None,
+        }
+    }
+}
 
 pub fn parse_and_apply() -> crate::error::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -116,7 +136,9 @@ pub fn parse_and_apply() -> crate::error::Result<()> {
 
             "--noize" => set("AETHER_NOIZE", next_value!()),
 
-            "--h2" | "--http2" => set("AETHER_MASQUE_HTTP2", "1"),
+            "--masque-transport" => apply_masque_transport(next_value!())?,
+            "--h3" | "--http3" | "--quic" => apply_masque_transport("h3")?,
+            "--h2" | "--http2" => apply_masque_transport("h2")?,
             "--h2-peer" => set("AETHER_MASQUE_H2_PEER", next_value!()),
             "--ech" => set("AETHER_ECH", next_value!()),
             "--no-data-check" => {
@@ -154,6 +176,48 @@ pub fn parse_and_apply() -> crate::error::Result<()> {
     Ok(())
 }
 
+fn apply_masque_transport(value: &str) -> crate::error::Result<()> {
+    let choice = MasqueTransportChoice::parse(value).ok_or_else(|| {
+        crate::error::AetherError::Other(format!(
+            "invalid MASQUE transport '{value}'; expected auto, h3, or h2"
+        ))
+    })?;
+
+    match choice {
+        MasqueTransportChoice::Auto => env::remove_var("AETHER_MASQUE_HTTP2"),
+        MasqueTransportChoice::Http3 => set("AETHER_MASQUE_HTTP2", "0"),
+        MasqueTransportChoice::Http2 => set("AETHER_MASQUE_HTTP2", "1"),
+    }
+
+    Ok(())
+}
+
 fn set(key: &str, value: &str) {
-    std::env::set_var(key, value);
+    env::set_var(key, value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_documented_masque_transport_modes_and_aliases() {
+        assert_eq!(
+            MasqueTransportChoice::parse("auto"),
+            Some(MasqueTransportChoice::Auto)
+        );
+        assert_eq!(
+            MasqueTransportChoice::parse("H3"),
+            Some(MasqueTransportChoice::Http3)
+        );
+        assert_eq!(
+            MasqueTransportChoice::parse("quic"),
+            Some(MasqueTransportChoice::Http3)
+        );
+        assert_eq!(
+            MasqueTransportChoice::parse("http2"),
+            Some(MasqueTransportChoice::Http2)
+        );
+        assert_eq!(MasqueTransportChoice::parse("invalid"), None);
+    }
 }

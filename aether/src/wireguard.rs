@@ -13,13 +13,15 @@ use crate::aethernoize::{self, AetherNoizeConfig};
 use crate::error::{AetherError, Result};
 
 const TIMER_TICK: Duration = Duration::from_millis(250);
-const MAX_PACKET: usize = 65536;
-const DEFAULT_WG_HEALTH_INTERVAL_SECS: u64 = 3;
-const DEFAULT_WG_STALE_SECS: u64 = 15;
-const DEFAULT_WG_STARTUP_SECS: u64 = 30;
+const MAX_PACKET: usize = 65_536;
+const DEFAULT_WG_HEALTH_INTERVAL_SECS: u64 = 15;
+const DEFAULT_WG_STALE_SECS: u64 = 60;
+const DEFAULT_WG_STARTUP_SECS: u64 = 45;
 
 const WG_MSG_TYPE_MIN: u8 = 1;
 const WG_MSG_TYPE_MAX: u8 = 4;
+const DATAPLANE_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+const DATAPLANE_RESEND_INTERVAL: Duration = Duration::from_millis(900);
 
 fn inject_client_id(packet: &mut [u8], client_id: &[u8; 3]) {
     if packet.len() < 4 {
@@ -73,6 +75,64 @@ pub struct EstablishedSession {
     client_id: [u8; 3],
 }
 
+#[derive(Default)]
+struct DecapsulatedBatch {
+    network_packets: Vec<Vec<u8>>,
+    tunnel_packets: Vec<Vec<u8>>,
+    authenticated: bool,
+}
+
+fn decapsulate_batch(
+    tunn: &mut Tunn,
+    datagram: &[u8],
+    output: &mut [u8],
+) -> DecapsulatedBatch {
+    let mut batch = DecapsulatedBatch::default();
+    let mut input = datagram;
+
+    loop {
+        match tunn.decapsulate(None, input, output) {
+            TunnResult::Done => {
+                batch.authenticated |= tunn.time_since_last_handshake().is_some();
+                break;
+            }
+            TunnResult::Err(error) => {
+                log::trace!("wireguard ignored invalid peer datagram: {error:?}");
+                break;
+            }
+            TunnResult::WriteToNetwork(packet) => {
+                batch.network_packets.push(packet.to_vec());
+                batch.authenticated |= tunn.time_since_last_handshake().is_some();
+                // BoringTun requires callers to drain pending network output by
+                // repeatedly decapsulating an empty datagram until Done.
+                input = &[];
+            }
+            TunnResult::WriteToTunnelV4(packet, _)
+            | TunnResult::WriteToTunnelV6(packet, _) => {
+                batch.tunnel_packets.push(packet.to_vec());
+                batch.authenticated = true;
+                break;
+            }
+        }
+    }
+
+    batch
+}
+
+async fn send_network_packets(
+    sock: &UdpSocket,
+    client_id: &[u8; 3],
+    packets: Vec<Vec<u8>>,
+) -> Result<()> {
+    for mut packet in packets {
+        inject_client_id(&mut packet, client_id);
+        sock.send(&packet).await.map_err(|error| {
+            AetherError::Other(format!("wireguard protocol response send failed: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
 impl WgTunnel {
     pub async fn new(cfg: WgConfig, inbound_tx: mpsc::Sender<Vec<u8>>) -> Result<Self> {
         let bind_addr = if cfg.peer_endpoint.is_ipv4() {
@@ -86,12 +146,10 @@ impl WgTunnel {
 
         let local_secret = StaticSecret::from(cfg.local_private_key);
         let peer_public = PublicKey::from(cfg.peer_public_key);
-        let preshared = cfg.preshared_key;
-
         let tunn = Tunn::new(
             local_secret,
             peer_public,
-            preshared,
+            cfg.preshared_key,
             cfg.persistent_keepalive,
             0,
             None,
@@ -104,7 +162,7 @@ impl WgTunnel {
             peer: cfg.peer_endpoint,
             inbound_tx,
             obf_sent: Arc::new(Mutex::new(false)),
-            aethernoize: cfg.aethernoize.clone(),
+            aethernoize: cfg.aethernoize,
             client_id: cfg.client_id,
             local_ipv4: cfg.local_ipv4,
             established: false,
@@ -146,11 +204,12 @@ impl WgTunnel {
         let aethernoize_t = self.aethernoize.clone();
         let client_id = self.client_id;
         let client_id_r = self.client_id;
+        let client_id_t = self.client_id;
         let client_id_h = self.client_id;
         let peer = self.peer;
         let local_ipv4 = self.local_ipv4;
 
-        let last_valid_rx: Arc<StdMutex<Instant>> = Arc::new(StdMutex::new(Instant::now()));
+        let last_valid_rx = Arc::new(StdMutex::new(Instant::now()));
         let last_valid_rx_r = last_valid_rx.clone();
         let last_valid_rx_h = last_valid_rx.clone();
         let ever_received = Arc::new(AtomicBool::new(self.established));
@@ -166,53 +225,22 @@ impl WgTunnel {
                     AetherError::Other(format!("wireguard receive failed: {error}"))
                 })?;
                 strip_client_id(&mut buffer[..read]);
-                let mut tunn = tunn_r.lock().await;
-                match tunn.decapsulate(None, &buffer[..read], &mut temporary) {
-                    TunnResult::Done => {
-                        mark_valid_rx(&last_valid_rx_r, &ever_received_r);
-                        drop(tunn);
-                        aethernoize::send_post_handshake_junk(
-                            &sock_r,
-                            peer,
-                            &aethernoize_r,
-                        )
-                        .await;
-                    }
-                    TunnResult::Err(error) => {
-                        log::trace!("decapsulate error: {error:?}");
-                    }
-                    TunnResult::WriteToNetwork(packet) => {
-                        mark_valid_rx(&last_valid_rx_r, &ever_received_r);
-                        let mut packet = packet.to_vec();
-                        inject_client_id(&mut packet, &client_id_r);
-                        drop(tunn);
-                        sock_r.send(&packet).await.map_err(|error| {
-                            AetherError::Other(format!(
-                                "wireguard handshake response send failed: {error}"
-                            ))
-                        })?;
-                        aethernoize::send_post_handshake_junk(
-                            &sock_r,
-                            peer,
-                            &aethernoize_r,
-                        )
-                        .await;
-                    }
-                    TunnResult::WriteToTunnelV4(packet, _)
-                    | TunnResult::WriteToTunnelV6(packet, _) => {
-                        mark_valid_rx(&last_valid_rx_r, &ever_received_r);
-                        let packet = packet.to_vec();
-                        drop(tunn);
-                        inbound_tx.send(packet).await.map_err(|_| {
-                            AetherError::Other("wireguard netstack input channel closed".into())
-                        })?;
-                        aethernoize::send_post_handshake_junk(
-                            &sock_r,
-                            peer,
-                            &aethernoize_r,
-                        )
-                        .await;
-                    }
+
+                let batch = {
+                    let mut tunn = tunn_r.lock().await;
+                    decapsulate_batch(&mut tunn, &buffer[..read], &mut temporary)
+                };
+
+                send_network_packets(&sock_r, &client_id_r, batch.network_packets).await?;
+                for packet in batch.tunnel_packets {
+                    inbound_tx.send(packet).await.map_err(|_| {
+                        AetherError::Other("wireguard netstack input channel closed".into())
+                    })?;
+                }
+
+                if batch.authenticated {
+                    mark_valid_rx(&last_valid_rx_r, &ever_received_r);
+                    aethernoize::send_post_handshake_junk(&sock_r, peer, &aethernoize_r).await;
                 }
             }
             #[allow(unreachable_code)]
@@ -222,38 +250,39 @@ impl WgTunnel {
         let send_task = tokio::spawn(async move {
             let mut output = vec![0u8; MAX_PACKET];
             while let Some(ip_packet) = outbound_rx.recv().await {
-                let mut tunn = tunn_w.lock().await;
-                match tunn.encapsulate(&ip_packet, &mut output) {
-                    TunnResult::Done => {}
-                    TunnResult::Err(error) => {
-                        log::trace!("encapsulate error: {error:?}");
-                    }
-                    TunnResult::WriteToNetwork(packet) => {
-                        let mut packet = packet.to_vec();
-                        inject_client_id(&mut packet, &client_id);
-                        drop(tunn);
-
-                        {
-                            let mut sent = obf_sent.lock().await;
-                            if !*sent && aethernoize.is_enabled() {
-                                *sent = true;
-                                drop(sent);
-                                aethernoize::apply_obfuscation(
-                                    &sock_w,
-                                    peer,
-                                    &aethernoize,
-                                )
-                                .await;
-                            }
+                let packet = {
+                    let mut tunn = tunn_w.lock().await;
+                    match tunn.encapsulate(&ip_packet, &mut output) {
+                        TunnResult::Done => continue,
+                        TunnResult::Err(error) => {
+                            return Err(AetherError::Other(format!(
+                                "wireguard encapsulation failed: {error:?}"
+                            )));
                         }
-
-                        sock_w.send(&packet).await.map_err(|error| {
-                            AetherError::Other(format!("wireguard send failed: {error}"))
-                        })?;
+                        TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                        TunnResult::WriteToTunnelV4(_, _)
+                        | TunnResult::WriteToTunnelV6(_, _) => {
+                            return Err(AetherError::Other(
+                                "wireguard encapsulation returned tunnel output".into(),
+                            ));
+                        }
                     }
-                    TunnResult::WriteToTunnelV4(_, _)
-                    | TunnResult::WriteToTunnelV6(_, _) => {}
+                };
+
+                {
+                    let mut sent = obf_sent.lock().await;
+                    if !*sent && aethernoize.is_enabled() {
+                        *sent = true;
+                        drop(sent);
+                        aethernoize::apply_obfuscation(&sock_w, peer, &aethernoize).await;
+                    }
                 }
+
+                let mut packet = packet;
+                inject_client_id(&mut packet, &client_id);
+                sock_w.send(&packet).await.map_err(|error| {
+                    AetherError::Other(format!("wireguard send failed: {error}"))
+                })?;
             }
             Err::<(), AetherError>(AetherError::Other(
                 "wireguard outbound channel closed".into(),
@@ -266,19 +295,33 @@ impl WgTunnel {
             let mut temporary = vec![0u8; MAX_PACKET];
             loop {
                 interval.tick().await;
-                let mut tunn = tunn_t.lock().await;
-                if let TunnResult::WriteToNetwork(packet) = tunn.update_timers(&mut temporary) {
-                    let mut packet = packet.to_vec();
-                    inject_client_id(&mut packet, &client_id);
-                    drop(tunn);
-
-                    if aethernoize_t.is_enabled() {
-                        aethernoize::send_keepalive_junk(&sock_t, &aethernoize_t).await;
+                let result = {
+                    let mut tunn = tunn_t.lock().await;
+                    match tunn.update_timers(&mut temporary) {
+                        TunnResult::Done => continue,
+                        TunnResult::Err(error) => {
+                            return Err(AetherError::Other(format!(
+                                "wireguard timer failed: {error:?}"
+                            )));
+                        }
+                        TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                        TunnResult::WriteToTunnelV4(_, _)
+                        | TunnResult::WriteToTunnelV6(_, _) => {
+                            return Err(AetherError::Other(
+                                "wireguard timer returned tunnel output".into(),
+                            ));
+                        }
                     }
-                    sock_t.send(&packet).await.map_err(|error| {
-                        AetherError::Other(format!("wireguard timer send failed: {error}"))
-                    })?;
+                };
+
+                if aethernoize_t.is_enabled() {
+                    aethernoize::send_keepalive_junk(&sock_t, &aethernoize_t).await;
                 }
+                let mut result = result;
+                inject_client_id(&mut result, &client_id_t);
+                sock_t.send(&result).await.map_err(|error| {
+                    AetherError::Other(format!("wireguard timer send failed: {error}"))
+                })?;
             }
             #[allow(unreachable_code)]
             Ok::<(), AetherError>(())
@@ -298,26 +341,21 @@ impl WgTunnel {
                 let received = ever_received_h.load(Ordering::Relaxed);
                 let idle = valid_rx_idle(&last_valid_rx_h);
                 if !received && started_at.elapsed() >= startup_timeout {
-                    log::warn!(
-                        "[wg] no valid response from peer {} during startup window {:?}",
-                        peer,
-                        startup_timeout
-                    );
                     return Err::<(), AetherError>(AetherError::Other(
-                        "wireguard startup timeout: no valid peer response".into(),
+                        "wireguard startup timeout: no authenticated peer response".into(),
                     ));
                 }
                 if received && idle >= stale_timeout {
-                    log::warn!(
-                        "[wg] no valid data from peer {} in {:?}; tunnel considered dead",
-                        peer,
-                        idle
-                    );
-                    return Err::<(), AetherError>(AetherError::Other(
-                        "wireguard tunnel stale: no valid data from peer".into(),
-                    ));
+                    return Err::<(), AetherError>(AetherError::Other(format!(
+                        "wireguard tunnel stale: no authenticated data for {idle:?}"
+                    )));
                 }
 
+                // Persistent keepalive handles NAT maintenance. Send the heavier
+                // DNS data-plane health probe only after an idle interval.
+                if idle < health_interval {
+                    continue;
+                }
                 let mut tunn = tunn_h.lock().await;
                 send_dataplane_probe(
                     &sock_h,
@@ -346,7 +384,6 @@ impl WgTunnel {
         send_abort.abort();
         timer_abort.abort();
         health_abort.abort();
-
         result
     }
 }
@@ -393,8 +430,8 @@ fn wg_healthcheck_interval() -> Duration {
     bounded_env_secs(
         "AETHER_WG_HEALTH_INTERVAL_SECS",
         DEFAULT_WG_HEALTH_INTERVAL_SECS,
-        1,
-        60,
+        5,
+        120,
     )
 }
 
@@ -402,8 +439,8 @@ fn wg_stale_timeout() -> Duration {
     let configured = bounded_env_secs(
         "AETHER_WG_STALE_SECS",
         DEFAULT_WG_STALE_SECS,
-        6,
-        300,
+        20,
+        600,
     );
     configured.max(wg_healthcheck_interval().saturating_mul(2))
 }
@@ -412,13 +449,20 @@ fn wg_startup_timeout() -> Duration {
     bounded_env_secs(
         "AETHER_WG_STARTUP_SECS",
         DEFAULT_WG_STARTUP_SECS,
-        10,
+        15,
         300,
     )
 }
 
-fn build_dns_query() -> Vec<u8> {
-    let id: u16 = rand::random();
+#[derive(Clone)]
+struct DataplaneProbe {
+    packet: Vec<u8>,
+    dns_id: u16,
+    source_port: u16,
+    source_ip: Ipv4Addr,
+}
+
+fn build_dns_query(id: u16) -> Vec<u8> {
     let mut query = Vec::with_capacity(32);
     query.extend_from_slice(&id.to_be_bytes());
     query.extend_from_slice(&[0x01, 0x00]);
@@ -450,69 +494,92 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn build_dataplane_probe(source: Ipv4Addr) -> Vec<u8> {
-    let dns = build_dns_query();
+fn build_dataplane_probe(source: Ipv4Addr) -> DataplaneProbe {
+    let dns_id: u16 = rand::random();
+    let source_port: u16 = rand::thread_rng().gen_range(20_000..60_000);
+    let dns = build_dns_query(dns_id);
     let udp_len = 8 + dns.len();
     let total_len = 20 + udp_len;
     let mut packet = Vec::with_capacity(total_len);
     packet.push(0x45);
     packet.push(0x00);
     packet.extend_from_slice(&(total_len as u16).to_be_bytes());
-    let id: u16 = rand::random();
-    packet.extend_from_slice(&id.to_be_bytes());
+    let ip_id: u16 = rand::random();
+    packet.extend_from_slice(&ip_id.to_be_bytes());
     packet.extend_from_slice(&[0x00, 0x00]);
     packet.push(64);
     packet.push(17);
     packet.extend_from_slice(&[0x00, 0x00]);
     packet.extend_from_slice(&source.octets());
-    packet.extend_from_slice(&Ipv4Addr::new(8, 8, 8, 8).octets());
+    packet.extend_from_slice(&DATAPLANE_DNS.octets());
     let checksum = ipv4_checksum(&packet[0..20]);
     packet[10..12].copy_from_slice(&checksum.to_be_bytes());
-    let source_port: u16 = rand::thread_rng().gen_range(20000..60000);
     packet.extend_from_slice(&source_port.to_be_bytes());
     packet.extend_from_slice(&53u16.to_be_bytes());
     packet.extend_from_slice(&(udp_len as u16).to_be_bytes());
     packet.extend_from_slice(&[0x00, 0x00]);
     packet.extend_from_slice(&dns);
-    packet
+
+    DataplaneProbe {
+        packet,
+        dns_id,
+        source_port,
+        source_ip: source,
+    }
+}
+
+fn is_matching_dataplane_response(packet: &[u8], probe: &DataplaneProbe) -> bool {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return false;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if header_len < 20 || packet.len() < header_len + 8 + 12 || packet[9] != 17 {
+        return false;
+    }
+    if packet[12..16] != DATAPLANE_DNS.octets()
+        || packet[16..20] != probe.source_ip.octets()
+    {
+        return false;
+    }
+
+    let udp = &packet[header_len..];
+    let source_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let destination_port = u16::from_be_bytes([udp[2], udp[3]]);
+    if source_port != 53 || destination_port != probe.source_port {
+        return false;
+    }
+
+    let dns = &udp[8..];
+    let dns_id = u16::from_be_bytes([dns[0], dns[1]]);
+    let flags = u16::from_be_bytes([dns[2], dns[3]]);
+    dns_id == probe.dns_id && flags & 0x8000 != 0
 }
 
 async fn send_dataplane_probe(
     sock: &UdpSocket,
     tunn: &mut Tunn,
     client_id: &[u8; 3],
-    probe: &[u8],
+    probe: &DataplaneProbe,
     output: &mut [u8],
 ) -> Result<()> {
-    match tunn.encapsulate(probe, output) {
+    match tunn.encapsulate(&probe.packet, output) {
         TunnResult::WriteToNetwork(packet) => {
             let mut packet = packet.to_vec();
             inject_client_id(&mut packet, client_id);
             sock.send(&packet).await?;
+            Ok(())
         }
-        TunnResult::Err(error) => {
-            return Err(AetherError::Other(format!(
-                "dataplane encapsulation failed: {error:?}"
-            )));
-        }
-        TunnResult::Done => {
-            return Err(AetherError::Other(
-                "dataplane probe produced no network packet".into(),
-            ));
-        }
-        TunnResult::WriteToTunnelV4(_, _)
-        | TunnResult::WriteToTunnelV6(_, _) => {
-            return Err(AetherError::Other(
-                "dataplane probe was routed to tunnel unexpectedly".into(),
-            ));
-        }
+        TunnResult::Err(error) => Err(AetherError::Other(format!(
+            "dataplane encapsulation failed: {error:?}"
+        ))),
+        TunnResult::Done => Err(AetherError::Other(
+            "dataplane probe produced no network packet".into(),
+        )),
+        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => Err(
+            AetherError::Other("dataplane probe was routed to tunnel unexpectedly".into()),
+        ),
     }
-    Ok(())
 }
-
-const DATAPLANE_REQUIRED_SUCCESSES: u32 = 2;
-const DATAPLANE_PROBE_GAP: Duration = Duration::from_millis(600);
-const DATAPLANE_RESEND_INTERVAL: Duration = Duration::from_millis(700);
 
 async fn verify_dataplane(
     sock: &UdpSocket,
@@ -527,18 +594,12 @@ async fn verify_dataplane(
     let mut recv_buffer = vec![0u8; MAX_PACKET];
     let mut temporary = vec![0u8; MAX_PACKET];
 
-    let mut successes: u32 = 0;
     send_dataplane_probe(sock, tunn, client_id, &probe, &mut output).await?;
     let mut resend_at = Instant::now() + DATAPLANE_RESEND_INTERVAL;
 
     loop {
         let now = Instant::now();
         if now >= deadline {
-            log::debug!(
-                "[wg] dataplane verify timed out ({}/{} confirmations)",
-                successes,
-                DATAPLANE_REQUIRED_SUCCESSES
-            );
             return Err(AetherError::Other("dataplane timeout".into()));
         }
         if now >= resend_at {
@@ -553,32 +614,14 @@ async fn verify_dataplane(
             result = sock.recv(&mut recv_buffer) => {
                 let read = result?;
                 strip_client_id(&mut recv_buffer[..read]);
-                match tunn.decapsulate(None, &recv_buffer[..read], &mut temporary) {
-                    TunnResult::WriteToTunnelV4(_, _)
-                    | TunnResult::WriteToTunnelV6(_, _) => {
-                        successes += 1;
-                        log::debug!(
-                            "[wg] dataplane round-trip {}/{} confirmed in {:?}",
-                            successes,
-                            DATAPLANE_REQUIRED_SUCCESSES,
-                            start.elapsed()
-                        );
-                        if successes >= DATAPLANE_REQUIRED_SUCCESSES {
-                            let elapsed = start.elapsed();
-                            log::debug!("[wg] dataplane ok in {elapsed:?}");
-                            return Ok(elapsed);
-                        }
-                        resend_at = Instant::now() + DATAPLANE_PROBE_GAP;
-                    }
-                    TunnResult::WriteToNetwork(packet) => {
-                        let mut packet = packet.to_vec();
-                        inject_client_id(&mut packet, client_id);
-                        sock.send(&packet).await?;
-                    }
-                    TunnResult::Err(error) => {
-                        log::trace!("[wg] dataplane decapsulation error: {error:?}");
-                    }
-                    TunnResult::Done => {}
+                let batch = decapsulate_batch(tunn, &recv_buffer[..read], &mut temporary);
+                send_network_packets(sock, client_id, batch.network_packets).await?;
+                if batch
+                    .tunnel_packets
+                    .iter()
+                    .any(|packet| is_matching_dataplane_response(packet, &probe))
+                {
+                    return Ok(start.elapsed());
                 }
             }
             _ = tokio::time::sleep(wait) => {}
@@ -621,13 +664,6 @@ pub async fn verify_endpoint_keep_session(
     keepalive: Option<u16>,
 ) -> Result<(Duration, EstablishedSession)> {
     let data_check = std::env::var("AETHER_WG_NO_DATA_CHECK").is_err();
-    log::trace!(
-        "[wg] verify {} obf={} data_check={}",
-        peer,
-        aethernoize.is_enabled(),
-        data_check
-    );
-
     let bind = if peer.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -638,17 +674,13 @@ pub async fn verify_endpoint_keep_session(
 
     let start = Instant::now();
     let deadline = start + timeout;
-
     if aethernoize.is_enabled() {
         aethernoize::apply_obfuscation(&sock, peer, aethernoize).await;
     }
 
-    let local_secret = StaticSecret::from(private_key);
-    let peer_key = PublicKey::from(peer_public);
-
     let mut tunn = Tunn::new(
-        local_secret,
-        peer_key,
+        StaticSecret::from(private_key),
+        PublicKey::from(peer_public),
         None,
         Some(keepalive.unwrap_or(25).clamp(1, 120)),
         0,
@@ -660,124 +692,65 @@ pub async fn verify_endpoint_keep_session(
     let mut recv_buffer = vec![0u8; MAX_PACKET];
     let mut temporary = vec![0u8; MAX_PACKET];
 
-    match tunn.encapsulate(&[], &mut output) {
-        TunnResult::WriteToNetwork(packet) => {
-            let mut packet = packet.to_vec();
-            inject_client_id(&mut packet, &client_id);
-            log::trace!("[wg] sending init {} bytes to {}", packet.len(), peer);
-            sock.send(&packet).await?;
-        }
+    let initial = match tunn.encapsulate(&[], &mut output) {
+        TunnResult::WriteToNetwork(packet) => packet.to_vec(),
         other => {
-            log::warn!("[wg] unexpected initial encapsulation result: {other:?}");
-            return Err(AetherError::Other("handshake init failed".into()));
+            return Err(AetherError::Other(format!(
+                "handshake initiation failed: {other:?}"
+            )));
         }
-    }
+    };
+    let mut initial = initial;
+    inject_client_id(&mut initial, &client_id);
+    sock.send(&initial).await?;
 
-    let mut attempts = 0;
     loop {
-        if Instant::now() >= deadline {
-            log::trace!("[wg] timeout after {attempts} receive attempts");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(AetherError::Other("verify timeout".into()));
         }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let read = match tokio::time::timeout(remaining, sock.recv(&mut recv_buffer)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(AetherError::Other("verify timeout".into())),
+        };
+        strip_client_id(&mut recv_buffer[..read]);
+        let batch = decapsulate_batch(&mut tunn, &recv_buffer[..read], &mut temporary);
+        send_network_packets(&sock, &client_id, batch.network_packets).await?;
 
-        tokio::select! {
-            result = sock.recv(&mut recv_buffer) => {
-                attempts += 1;
-                let read = result?;
-                log::trace!("[wg] recv {read} bytes (attempt {attempts})");
-                strip_client_id(&mut recv_buffer[..read]);
-
-                match tunn.decapsulate(None, &recv_buffer[..read], &mut temporary) {
-                    TunnResult::Done => {
-                        let elapsed = start.elapsed();
-                        log::trace!("[wg] handshake done in {elapsed:?}");
-                        if data_check {
-                            let dataplane_elapsed = verify_dataplane(
-                                &sock,
-                                &mut tunn,
-                                &client_id,
-                                local_ipv4,
-                                start,
-                                deadline,
-                            )
-                            .await?;
-                            return Ok((
-                                dataplane_elapsed,
-                                EstablishedSession {
-                                    tunn: Arc::new(Mutex::new(Box::new(tunn))),
-                                    sock: Arc::new(sock),
-                                    peer,
-                                    client_id,
-                                },
-                            ));
-                        }
-                        return Ok((
-                            elapsed,
-                            EstablishedSession {
-                                tunn: Arc::new(Mutex::new(Box::new(tunn))),
-                                sock: Arc::new(sock),
-                                peer,
-                                client_id,
-                            },
-                        ));
-                    }
-                    TunnResult::WriteToNetwork(packet) => {
-                        let mut packet = packet.to_vec();
-                        inject_client_id(&mut packet, &client_id);
-                        log::trace!("[wg] sending response {} bytes", packet.len());
-                        sock.send(&packet).await?;
-                        let elapsed = start.elapsed();
-                        log::trace!("[wg] handshake success in {elapsed:?}");
-                        if data_check {
-                            let dataplane_elapsed = verify_dataplane(
-                                &sock,
-                                &mut tunn,
-                                &client_id,
-                                local_ipv4,
-                                start,
-                                deadline,
-                            )
-                            .await?;
-                            return Ok((
-                                dataplane_elapsed,
-                                EstablishedSession {
-                                    tunn: Arc::new(Mutex::new(Box::new(tunn))),
-                                    sock: Arc::new(sock),
-                                    peer,
-                                    client_id,
-                                },
-                            ));
-                        }
-                        return Ok((
-                            elapsed,
-                            EstablishedSession {
-                                tunn: Arc::new(Mutex::new(Box::new(tunn))),
-                                sock: Arc::new(sock),
-                                peer,
-                                client_id,
-                            },
-                        ));
-                    }
-                    TunnResult::Err(error) => {
-                        log::trace!("[wg] decapsulation error: {error:?}");
-                    }
-                    other => {
-                        log::trace!("[wg] unexpected decapsulation result: {other:?}");
-                    }
-                }
-            }
-            _ = tokio::time::sleep(remaining) => {
-                log::trace!("[wg] verification wait timed out");
-                return Err(AetherError::Other("verify timeout".into()));
-            }
+        if tunn.time_since_last_handshake().is_none() {
+            continue;
         }
+
+        let elapsed = if data_check {
+            verify_dataplane(
+                &sock,
+                &mut tunn,
+                &client_id,
+                local_ipv4,
+                start,
+                deadline,
+            )
+            .await?
+        } else {
+            start.elapsed()
+        };
+
+        return Ok((
+            elapsed,
+            EstablishedSession {
+                tunn: Arc::new(Mutex::new(Box::new(tunn))),
+                sock: Arc::new(sock),
+                peer,
+                client_id,
+            },
+        ));
     }
 }
 
 pub const WG_PREFIXES_V4: &[&str] = &[
     "162.159.192.0/24",
+    "162.159.193.0/24",
     "162.159.195.0/24",
     "188.114.96.0/24",
     "188.114.97.0/24",
@@ -785,27 +758,33 @@ pub const WG_PREFIXES_V4: &[&str] = &[
     "188.114.99.0/24",
 ];
 
-pub const WG_PREFIXES_V6: &[&str] = &["2606:4700:d0::/64", "2606:4700:d1::/64"];
+pub const WG_PRIMARY_PREFIXES_V4: &[&str] = &["162.159.192.0/24", "162.159.193.0/24"];
+pub const WG_PREFIXES_V6: &[&str] = &[
+    "2606:4700:100::/48",
+    "2606:4700:d0::/64",
+    "2606:4700:d1::/64",
+];
+pub const WG_PRIMARY_PREFIXES_V6: &[&str] = &["2606:4700:100::/48"];
 
 pub const WG_PORTS: &[u16] = &[
-    500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 934, 939, 942, 943, 945,
-    946, 955, 968, 987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 1387, 1701,
-    1843, 2371, 2408, 2506, 3138, 3476, 3581, 3854, 4177, 4198, 4233, 4500, 5279,
+    2408, 500, 1701, 4500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 934,
+    939, 942, 943, 945, 946, 955, 968, 987, 988, 1002, 1010, 1014, 1018, 1070, 1074,
+    1180, 1387, 1843, 2371, 2506, 3138, 3476, 3581, 3854, 4177, 4198, 4233, 5279,
     5956, 7103, 7152, 7156, 7281, 7559, 8319, 8742, 8854, 8886,
 ];
+pub const WG_PRIMARY_PORTS: &[u16] = &[2408, 500, 1701, 4500];
 
 pub const WG_SEEDS_V4: &[&str] = &[
     "162.159.192.1",
-    "162.159.195.1",
-    "188.114.96.1",
-    "188.114.97.1",
+    "162.159.193.1",
+    "162.159.192.2",
+    "162.159.193.2",
 ];
 
 pub const WG_SEEDS_V6: &[&str] = &[
+    "2606:4700:100::1",
     "2606:4700:d0::a29f:c001",
     "2606:4700:d1::a29f:c001",
-    "2606:4700:d0::a29f:c301",
-    "2606:4700:d0::bc72:6001",
 ];
 
 #[cfg(test)]
@@ -828,6 +807,12 @@ mod tests {
     #[test]
     fn health_timeouts_are_bounded() {
         assert!(wg_stale_timeout() >= wg_healthcheck_interval().saturating_mul(2));
-        assert!(wg_startup_timeout() >= Duration::from_secs(10));
+        assert!(wg_startup_timeout() >= Duration::from_secs(15));
+    }
+
+    #[test]
+    fn dataplane_response_validation_rejects_unrelated_packets() {
+        let probe = build_dataplane_probe(Ipv4Addr::new(172, 16, 0, 2));
+        assert!(!is_matching_dataplane_response(&probe.packet, &probe));
     }
 }

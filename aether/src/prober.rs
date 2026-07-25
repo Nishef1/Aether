@@ -44,13 +44,26 @@ pub const MASQUE_CIDRS_V6: &[&str] = &[
     "2606:4700:102::/48",
 ];
 
-pub const MASQUE_SEEDS_V6: &[&str] = &["2606:4700:d0::a29f:c602", "2606:4700:d1::a29f:c602", "2606:4700:d0::a29f:c601", "2606:4700:d0::a29f:c001"];
+pub const MASQUE_SEEDS_V6: &[&str] = &[
+    "2606:4700:d0::a29f:c602",
+    "2606:4700:d1::a29f:c602",
+    "2606:4700:d0::a29f:c601",
+    "2606:4700:d0::a29f:c001",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeResult {
     pub ip: IpAddr,
     pub port: u16,
     pub rtt: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfirmedResult {
+    probe: ProbeResult,
+    successes: usize,
+    attempts: usize,
+    score: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,70 +132,83 @@ impl ScanMode {
     fn strategy(&self) -> Strategy {
         match self {
             ScanMode::Turbo => Strategy {
-                concurrency: 20,
-                per_probe_timeout: Duration::from_millis(6000),
-                overall_deadline: Duration::from_secs(45),
-                quiet_after_first: Duration::from_secs(0),
+                concurrency: 24,
+                per_probe_timeout: Duration::from_millis(4000),
+                overall_deadline: Duration::from_secs(25),
+                settle_after_target: Duration::ZERO,
                 target_successes: 1,
                 early_exit_first: true,
                 full_subnet: false,
-                sample_per_cidr: 64,
+                sample_per_cidr: 48,
+                finalists: 1,
+                finalist_attempts: 1,
             },
             ScanMode::Balanced => Strategy {
-                concurrency: 16,
-                per_probe_timeout: Duration::from_millis(6000),
-                overall_deadline: Duration::from_secs(120),
-                quiet_after_first: Duration::from_secs(20),
-                target_successes: 6,
+                concurrency: 20,
+                per_probe_timeout: Duration::from_millis(5000),
+                overall_deadline: Duration::from_secs(60),
+                settle_after_target: Duration::from_secs(4),
+                target_successes: 12,
                 early_exit_first: false,
                 full_subnet: false,
-                sample_per_cidr: 140,
+                sample_per_cidr: 96,
+                finalists: 5,
+                finalist_attempts: 3,
             },
             ScanMode::Thorough => Strategy {
-                concurrency: 20,
-                per_probe_timeout: Duration::from_millis(10000),
-                overall_deadline: Duration::from_secs(300),
-                quiet_after_first: Duration::from_secs(30),
-                target_successes: 0,
+                concurrency: 24,
+                per_probe_timeout: Duration::from_millis(7000),
+                overall_deadline: Duration::from_secs(120),
+                settle_after_target: Duration::from_secs(8),
+                target_successes: 32,
                 early_exit_first: false,
-                full_subnet: true,
-                sample_per_cidr: 0,
+                full_subnet: false,
+                sample_per_cidr: 160,
+                finalists: 8,
+                finalist_attempts: 3,
             },
             ScanMode::Stealth => Strategy {
                 concurrency: 3,
-                per_probe_timeout: Duration::from_millis(12000),
-                overall_deadline: Duration::from_secs(180),
-                quiet_after_first: Duration::from_secs(25),
-                target_successes: 4,
+                per_probe_timeout: Duration::from_millis(10000),
+                overall_deadline: Duration::from_secs(120),
+                settle_after_target: Duration::from_secs(10),
+                target_successes: 8,
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 64,
+                finalists: 4,
+                finalist_attempts: 3,
             },
             ScanMode::Ironclad => Strategy {
                 concurrency: 4,
-                per_probe_timeout: Duration::from_millis(15000),
-                overall_deadline: Duration::from_secs(180),
-                quiet_after_first: Duration::from_secs(15),
-                target_successes: 3,
+                per_probe_timeout: Duration::from_millis(12000),
+                overall_deadline: Duration::from_secs(150),
+                settle_after_target: Duration::from_secs(8),
+                target_successes: 6,
                 early_exit_first: false,
                 full_subnet: false,
-                sample_per_cidr: 140,
+                sample_per_cidr: 96,
+                finalists: 4,
+                finalist_attempts: 3,
             },
         }
     }
 }
 
 const IRONCLAD_TCPING_TIMEOUT: Duration = Duration::from_secs(10);
+const FAILED_CONFIRMATION_PENALTY: Duration = Duration::from_millis(250);
 
 struct Strategy {
     concurrency: usize,
     per_probe_timeout: Duration,
     overall_deadline: Duration,
-    quiet_after_first: Duration,
+    settle_after_target: Duration,
     target_successes: usize,
     early_exit_first: bool,
     full_subnet: bool,
     sample_per_cidr: usize,
+    finalists: usize,
+    finalist_attempts: usize,
 }
 
 #[derive(Clone)]
@@ -207,10 +233,11 @@ pub async fn host_has_ipv6() -> bool {
 }
 
 pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<ProbeResult> {
-    let mut st = mode.strategy();
-    st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
-    let timeout = st.per_probe_timeout;
+    let mut strategy = mode.strategy();
+    strategy.concurrency = crate::sysprofile::cap_concurrency(strategy.concurrency);
+    let timeout = strategy.per_probe_timeout;
     let mut effective_ip = probe.ip;
+
     if probe.ip.want_v6() && !host_has_ipv6().await {
         if probe.ip.want_v4() {
             log::warn!("[-] host has no IPv6 route; falling back to IPv4-only scan");
@@ -220,49 +247,49 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
             return Err(AetherError::NoCleanEndpoint);
         }
     }
-    let candidates = build_candidates(&st, &probe.ports, effective_ip);
+
+    let candidates = build_candidates(&strategy, &probe.ports, effective_ip);
 
     log::info!(
-        "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?}",
+        "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?} target={} finalists={} confirmations={}",
         mode.label(),
         effective_ip.label(),
         candidates.len(),
         probe.ports,
-        st.concurrency,
-        st.per_probe_timeout,
-        st.overall_deadline,
+        strategy.concurrency,
+        strategy.per_probe_timeout,
+        strategy.overall_deadline,
+        strategy.target_successes,
+        strategy.finalists,
+        strategy.finalist_attempts,
     );
 
     let ironclad = mode == ScanMode::Ironclad;
-
     let stream = futures::stream::iter(
         candidates
             .into_iter()
             .map(|(ip, port)| verify_one(probe, ip, port, timeout, ironclad)),
     )
-    .buffer_unordered(st.concurrency);
+    .buffer_unordered(strategy.concurrency);
     tokio::pin!(stream);
 
-    let deadline = Instant::now() + st.overall_deadline;
-    let mut best: Option<ProbeResult> = None;
-    let mut found = 0usize;
-    let mut quiet_until: Option<Instant> = None;
+    let deadline = Instant::now() + strategy.overall_deadline;
+    let mut successful = Vec::new();
+    let mut settle_until: Option<Instant> = None;
 
     loop {
-        let effective = match quiet_until {
-            Some(q) => q.min(deadline),
-            None => deadline,
-        };
-        let remaining = effective.saturating_duration_since(Instant::now());
+        let effective_deadline = settle_until
+            .map(|settle| settle.min(deadline))
+            .unwrap_or(deadline);
+        let remaining = effective_deadline.saturating_duration_since(Instant::now());
+
         if remaining.is_zero() {
-            if best.is_some() {
-                if quiet_until.is_some() {
-                    log::info!("[+] no new gateways recently, finalizing selection");
-                } else {
-                    log::warn!("[-] scan deadline reached");
-                }
-            } else {
+            if successful.is_empty() {
                 log::warn!("[-] scan deadline reached with no gateway");
+            } else if settle_until.is_some() {
+                log::info!("[+] discovery settle window completed; confirming finalists");
+            } else {
+                log::warn!("[-] scan deadline reached; confirming discovered gateways");
             }
             break;
         }
@@ -272,50 +299,176 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
                 match item {
                     None => break,
                     Some(None) => continue,
-                    Some(Some(pr)) => {
-                        log::info!("[+] candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-                        if st.early_exit_first {
-                            return Ok(pr);
+                    Some(Some(result)) => {
+                        log::info!(
+                            "[+] candidate ok {}:{} rtt={:?}",
+                            result.ip,
+                            result.port,
+                            result.rtt
+                        );
+
+                        if strategy.early_exit_first {
+                            return Ok(result);
                         }
-                        best = Some(match best {
-                            Some(cur) if cur.rtt <= pr.rtt => cur,
-                            _ => pr,
-                        });
-                        found += 1;
-                        
-                        if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
-                            log::info!("[+] reached target of {} gateways, selecting best", st.target_successes);
-                            if !st.quiet_after_first.is_zero() {
-                                quiet_until = Some(Instant::now() + st.quiet_after_first);
-                            } else {
+
+                        successful.push(result);
+
+                        if strategy.target_successes > 0
+                            && successful.len() >= strategy.target_successes
+                            && settle_until.is_none()
+                        {
+                            log::info!(
+                                "[+] reached discovery target of {} gateways; observing for {:?} before confirmation",
+                                strategy.target_successes,
+                                strategy.settle_after_target
+                            );
+
+                            if strategy.settle_after_target.is_zero() {
                                 break;
                             }
+                            settle_until = Some(Instant::now() + strategy.settle_after_target);
                         }
                     }
                 }
             }
             _ = tokio::time::sleep(remaining) => {
-                if best.is_some() {
-                    if quiet_until.is_some() {
-                        log::info!("[+] no new gateways recently, finalizing selection");
-                    } else {
-                        log::warn!("[-] scan deadline reached");
-                    }
-                } else {
+                if successful.is_empty() {
                     log::warn!("[-] scan deadline reached with no gateway");
+                } else {
+                    log::info!("[+] discovery window completed; confirming finalists");
                 }
                 break;
             }
         }
     }
 
-    match best {
-        Some(pr) => {
-            log::info!("[+] best gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            Ok(pr)
-        }
-        None => Err(AetherError::NoCleanEndpoint),
+    if successful.is_empty() {
+        return Err(AetherError::NoCleanEndpoint);
     }
+
+    successful.sort_by_key(|result| result.rtt);
+    let discovery_best = successful[0];
+    let finalist_count = strategy.finalists.max(1).min(successful.len());
+    let finalists = successful
+        .into_iter()
+        .take(finalist_count)
+        .collect::<Vec<_>>();
+
+    log::info!(
+        "[*] confirming {} finalist gateways with {} total measurements each",
+        finalists.len(),
+        strategy.finalist_attempts
+    );
+
+    let confirmation_concurrency = strategy.concurrency.min(finalists.len()).max(1);
+    let confirmation_stream = futures::stream::iter(finalists.into_iter().map(|candidate| {
+        confirm_candidate(
+            probe,
+            candidate,
+            timeout,
+            ironclad,
+            strategy.finalist_attempts,
+        )
+    }))
+    .buffer_unordered(confirmation_concurrency);
+    tokio::pin!(confirmation_stream);
+
+    let mut confirmed = Vec::new();
+    while let Some(result) = confirmation_stream.next().await {
+        if let Some(result) = result {
+            log::info!(
+                "[+] finalist {}:{} median={:?} reliability={}/{} score={:?}",
+                result.probe.ip,
+                result.probe.port,
+                result.probe.rtt,
+                result.successes,
+                result.attempts,
+                result.score
+            );
+            confirmed.push(result);
+        }
+    }
+
+    if confirmed.is_empty() {
+        log::warn!(
+            "[-] no finalist passed repeated confirmation; falling back to discovery best {}:{} rtt={:?}",
+            discovery_best.ip,
+            discovery_best.port,
+            discovery_best.rtt
+        );
+        return Ok(discovery_best);
+    }
+
+    confirmed.sort_by(|left, right| {
+        left.score
+            .cmp(&right.score)
+            .then_with(|| left.probe.rtt.cmp(&right.probe.rtt))
+            .then_with(|| right.successes.cmp(&left.successes))
+    });
+
+    let selected = confirmed[0];
+    log::info!(
+        "[+] best gateway {}:{} median_rtt={:?} reliability={}/{} score={:?}",
+        selected.probe.ip,
+        selected.probe.port,
+        selected.probe.rtt,
+        selected.successes,
+        selected.attempts,
+        selected.score
+    );
+    Ok(selected.probe)
+}
+
+async fn confirm_candidate(
+    probe: &MasqueProbe,
+    candidate: ProbeResult,
+    timeout: Duration,
+    ironclad: bool,
+    attempts: usize,
+) -> Option<ConfirmedResult> {
+    let attempts = attempts.max(1);
+    let required_successes = attempts / 2 + 1;
+    let mut samples = Vec::with_capacity(attempts);
+    samples.push(candidate.rtt);
+
+    for _ in 1..attempts {
+        if let Some(result) =
+            verify_one(probe, candidate.ip, candidate.port, timeout, ironclad).await
+        {
+            samples.push(result.rtt);
+        }
+    }
+
+    let successes = samples.len();
+    if successes < required_successes {
+        log::info!(
+            "[-] finalist {}:{} rejected after repeated confirmation ({}/{})",
+            candidate.ip,
+            candidate.port,
+            successes,
+            attempts
+        );
+        return None;
+    }
+
+    samples.sort();
+    let median = samples[samples.len() / 2];
+    let failures = attempts.saturating_sub(successes) as u32;
+    let penalty = FAILED_CONFIRMATION_PENALTY
+        .checked_mul(failures)
+        .unwrap_or(Duration::MAX);
+    let score = median.checked_add(penalty).unwrap_or(Duration::MAX);
+
+    Some(ConfirmedResult {
+        probe: ProbeResult {
+            ip: candidate.ip,
+            port: candidate.port,
+            rtt: median,
+        },
+        successes,
+        attempts,
+        score,
+    })
 }
 
 async fn verify_one(
@@ -340,18 +493,21 @@ async fn verify_one(
         };
         return match crate::tunnelping::masque_http_ping(&params, IRONCLAD_TCPING_TIMEOUT).await {
             Ok(rtt) => {
-                log::info!("[+] ironclad verified {ip}:{port} real http round trip rtt={:?}", rtt);
+                log::info!(
+                    "[+] ironclad verified {ip}:{port} real http round trip rtt={:?}",
+                    rtt
+                );
                 Some(ProbeResult { ip, port, rtt })
             }
-            Err(e) => {
-                log::trace!("[-] ironclad {ip}:{port} failed real http check: {e}");
+            Err(error) => {
+                log::trace!("[-] ironclad {ip}:{port} failed real http check: {error}");
                 None
             }
         };
     }
 
     if crate::masque_h2::enabled() {
-        let cfg = crate::masque_h2::H2TunnelConfig {
+        let config = crate::masque_h2::H2TunnelConfig {
             peer: SocketAddr::new(ip, port),
             sni: probe.sni.clone(),
             authority: probe.authority.clone(),
@@ -361,69 +517,79 @@ async fn verify_one(
             local_ipv4: probe.local_ipv4,
             quiet: true,
             pin_endpoint: true,
-            expected_pins: crate::consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
+            expected_pins: crate::consts::MASQUE_PINS
+                .iter()
+                .map(|pin| pin.to_vec())
+                .collect(),
         };
-        return match crate::masque_h2::verify_h2(&cfg, timeout).await {
+        return match crate::masque_h2::verify_h2(&config, timeout).await {
             Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
-            Err(e) => {
-                log::trace!("h2 probe {ip}:{port} -> {e}");
+            Err(error) => {
+                log::trace!("h2 probe {ip}:{port} -> {error}");
                 None
             }
         };
     }
 
-    let vp = quic::VerifyParams {
+    let params = quic::VerifyParams {
         peer: SocketAddr::new(ip, port),
         sni: probe.sni.clone(),
         authority: probe.authority.clone(),
         path: probe.path.clone(),
         cert_pem: probe.cert_pem.to_vec(),
         key_pem: probe.key_pem.to_vec(),
-        ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
+        ech_config_list: probe.ech_config_list.as_ref().map(|value| value.to_vec()),
         noize: probe.noize.clone(),
         timeout,
         local_ipv4: probe.local_ipv4,
     };
 
-    match quic::verify_masque(&vp).await {
+    match quic::verify_masque(&params).await {
         Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
-        Err(e) => {
-            log::trace!("probe {ip}:{port} -> {e}");
+        Err(error) => {
+            log::trace!("probe {ip}:{port} -> {error}");
             None
         }
     }
 }
 
-fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
+fn build_candidates(strategy: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
     let primary = ports.first().copied().unwrap_or(443);
-    let mut out: Vec<(IpAddr, u16)> = Vec::new();
-    let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
 
-    let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
-    let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
+    let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS
+        .iter()
+        .filter_map(|seed| seed.parse().ok())
+        .collect();
+    let seeds_v6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6
+        .iter()
+        .filter_map(|seed| seed.parse().ok())
+        .collect();
 
     if ip.want_v4() {
-        for a in &seeds {
-            if seen.insert((IpAddr::V4(*a), primary)) {
-                out.push((IpAddr::V4(*a), primary));
+        for address in &seeds {
+            if seen.insert((IpAddr::V4(*address), primary)) {
+                candidates.push((IpAddr::V4(*address), primary));
             }
         }
+
         let cidr_hosts: Vec<Vec<Ipv4Addr>> = MASQUE_CIDRS_V4
             .iter()
-            .map(|c| {
-                if st.full_subnet {
-                    enumerate_cidr_v4(c)
+            .map(|cidr| {
+                if strategy.full_subnet {
+                    enumerate_cidr_v4(cidr)
                 } else {
-                    sample_cidr_v4(c, st.sample_per_cidr)
+                    sample_cidr_v4(cidr, strategy.sample_per_cidr)
                 }
             })
             .collect();
-        let max_len = cidr_hosts.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max_len {
+        let max_length = cidr_hosts.iter().map(Vec::len).max().unwrap_or(0);
+        for index in 0..max_length {
             for hosts in &cidr_hosts {
-                if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V4(*a), primary)) {
-                        out.push((IpAddr::V4(*a), primary));
+                if let Some(address) = hosts.get(index) {
+                    if seen.insert((IpAddr::V4(*address), primary)) {
+                        candidates.push((IpAddr::V4(*address), primary));
                     }
                 }
             }
@@ -431,22 +597,27 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     }
 
     if ip.want_v6() {
-        for a in &seeds6 {
-            if seen.insert((IpAddr::V6(*a), primary)) {
-                out.push((IpAddr::V6(*a), primary));
+        for address in &seeds_v6 {
+            if seen.insert((IpAddr::V6(*address), primary)) {
+                candidates.push((IpAddr::V6(*address), primary));
             }
         }
-        let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
-        let cidr6: Vec<Vec<Ipv6Addr>> = MASQUE_CIDRS_V6
+
+        let per_cidr = if strategy.sample_per_cidr == 0 {
+            96
+        } else {
+            strategy.sample_per_cidr
+        };
+        let cidr_hosts: Vec<Vec<Ipv6Addr>> = MASQUE_CIDRS_V6
             .iter()
-            .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
+            .map(|cidr| sample_cidr_v6(cidr, per_cidr, MASQUE_CIDRS_V4))
             .collect();
-        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max6 {
-            for hosts in &cidr6 {
-                if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V6(*a), primary)) {
-                        out.push((IpAddr::V6(*a), primary));
+        let max_length = cidr_hosts.iter().map(Vec::len).max().unwrap_or(0);
+        for index in 0..max_length {
+            for hosts in &cidr_hosts {
+                if let Some(address) = hosts.get(index) {
+                    if seen.insert((IpAddr::V6(*address), primary)) {
+                        candidates.push((IpAddr::V6(*address), primary));
                     }
                 }
             }
@@ -454,35 +625,39 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     }
 
     if ip.want_v4() {
-        for a in &seeds {
+        for address in &seeds {
             for &port in ports {
-                if port != primary && seen.insert((IpAddr::V4(*a), port)) {
-                    out.push((IpAddr::V4(*a), port));
-                }
-            }
-        }
-    }
-    if ip.want_v6() {
-        for a in &seeds6 {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
-                    out.push((IpAddr::V6(*a), port));
+                if port != primary && seen.insert((IpAddr::V4(*address), port)) {
+                    candidates.push((IpAddr::V4(*address), port));
                 }
             }
         }
     }
 
-    out
+    if ip.want_v6() {
+        for address in &seeds_v6 {
+            for &port in ports {
+                if port != primary && seen.insert((IpAddr::V6(*address), port)) {
+                    candidates.push((IpAddr::V6(*address), port));
+                }
+            }
+        }
+    }
+
+    candidates
 }
 
 fn parse_cidr_v4(cidr: &str) -> Option<(u32, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((u32::from(ip.parse::<Ipv4Addr>().ok()?), prefix.parse().ok()?))
+    Some((
+        u32::from(ip.parse::<Ipv4Addr>().ok()?),
+        prefix.parse().ok()?,
+    ))
 }
 
 fn enumerate_cidr_v4(cidr: &str) -> Vec<Ipv4Addr> {
     let (base, prefix) = match parse_cidr_v4(cidr) {
-        Some(v) => v,
+        Some(value) => value,
         None => return Vec::new(),
     };
     let host_bits = 32u32.saturating_sub(prefix as u32);
@@ -494,68 +669,80 @@ fn enumerate_cidr_v4(cidr: &str) -> Vec<Ipv4Addr> {
     }
     let size = 1u32 << host_bits;
     (1..size.saturating_sub(1))
-        .map(|off| Ipv4Addr::from(base + off))
+        .map(|offset| Ipv4Addr::from(base + offset))
         .collect()
 }
 
-fn sample_cidr_v4(cidr: &str, n: usize) -> Vec<Ipv4Addr> {
+fn sample_cidr_v4(cidr: &str, count: usize) -> Vec<Ipv4Addr> {
     let (base, prefix) = match parse_cidr_v4(cidr) {
-        Some(v) => v,
+        Some(value) => value,
         None => return Vec::new(),
     };
     let host_bits = 32u32.saturating_sub(prefix as u32);
-    let size = if host_bits >= 32 { u32::MAX } else { 1u32 << host_bits };
+    let size = if host_bits >= 32 {
+        u32::MAX
+    } else {
+        1u32 << host_bits
+    };
     if size <= 2 {
         return vec![Ipv4Addr::from(base)];
     }
 
     let usable = size - 2;
-    let want = (n as u32).min(usable);
-    let mut rng = rand::thread_rng();
-    let mut chosen: HashSet<u32> = HashSet::with_capacity(want as usize);
-    let mut out = Vec::with_capacity(want as usize);
+    let wanted = (count as u32).min(usable);
+    let mut random = rand::thread_rng();
+    let mut chosen = HashSet::with_capacity(wanted as usize);
+    let mut addresses = Vec::with_capacity(wanted as usize);
 
-    while (out.len() as u32) < want {
-        let off = 1 + rng.gen_range(0..usable);
-        if chosen.insert(off) {
-            out.push(Ipv4Addr::from(base + off));
+    while (addresses.len() as u32) < wanted {
+        let offset = 1 + random.gen_range(0..usable);
+        if chosen.insert(offset) {
+            addresses.push(Ipv4Addr::from(base + offset));
         }
     }
 
-    out
+    addresses
 }
 
 fn parse_cidr_v6(cidr: &str) -> Option<(u128, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((u128::from(ip.parse::<Ipv6Addr>().ok()?), prefix.parse().ok()?))
+    Some((
+        u128::from(ip.parse::<Ipv6Addr>().ok()?),
+        prefix.parse().ok()?,
+    ))
 }
 
-fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
+fn sample_cidr_v6(cidr: &str, count: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
     let (base, prefix) = match parse_cidr_v6(cidr) {
-        Some(v) => v,
+        Some(value) => value,
         None => return Vec::new(),
     };
     if 128u32.saturating_sub(prefix as u32) == 0 {
         return vec![Ipv6Addr::from(base)];
     }
 
-    let v4: Vec<(u32, u8)> = v4_cidrs.iter().filter_map(|c| parse_cidr_v4(c)).collect();
-    let mut rng = rand::thread_rng();
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let embedded = if v4.is_empty() {
-            rng.gen::<u32>() as u128
+    let v4_ranges: Vec<(u32, u8)> = v4_cidrs
+        .iter()
+        .filter_map(|cidr| parse_cidr_v4(cidr))
+        .collect();
+    let mut random = rand::thread_rng();
+    let mut addresses = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let embedded = if v4_ranges.is_empty() {
+            random.gen::<u32>() as u128
         } else {
-            let (b, p) = v4[rng.gen_range(0..v4.len())];
-            let host_bits = 32u32.saturating_sub(p as u32);
+            let (network, prefix) = v4_ranges[random.gen_range(0..v4_ranges.len())];
+            let host_bits = 32u32.saturating_sub(prefix as u32);
             let host = if host_bits == 0 {
                 0
             } else {
-                rng.gen::<u32>() & ((1u32 << host_bits) - 1)
+                random.gen::<u32>() & ((1u32 << host_bits) - 1)
             };
-            (b | host) as u128
+            (network | host) as u128
         };
-        out.push(Ipv6Addr::from(base | embedded));
+        addresses.push(Ipv6Addr::from(base | embedded));
     }
-    out
+
+    addresses
 }

@@ -10,45 +10,54 @@ use crate::error::{AetherError, Result};
 use crate::noize::NoizeConfig;
 use crate::quic;
 
+// Cloudflare's documented MASQUE ingress ranges are deliberately kept separate
+// from legacy/proven compatibility ranges. Broad Cloudflare CDN ranges are not
+// scanned by default because they mostly produce unrelated certificates and
+// expensive false-positive TLS handshakes.
 pub const MASQUE_CIDRS_V4: &[&str] = &[
-    "162.159.36.0/24",
-    "162.159.46.0/24",
-    "162.159.192.0/24",
+    "162.159.192.0/24", // consumer WARP ingress
+    "162.159.197.0/24", // documented MASQUE ingress
+    "162.159.198.0/24", // proven consumer compatibility range
+];
+
+const MASQUE_COMPAT_CIDRS_V4: &[&str] = &[
     "162.159.193.0/24",
     "162.159.195.0/24",
     "162.159.196.0/24",
-    "162.159.197.0/24",
-    "162.159.198.0/24",
     "162.159.204.0/24",
-    "172.65.251.0/24",
-    "188.114.96.0/24",
-    "188.114.97.0/24",
-    "188.114.98.0/24",
-    "188.114.99.0/24",
 ];
 
 pub const MASQUE_SEEDS: &[&str] = &[
-    "162.159.198.2",
-    "162.159.198.1",
     "162.159.192.1",
+    "162.159.197.1",
+    "162.159.198.1",
+    "162.159.198.2",
+];
+
+const MASQUE_COMPAT_SEEDS: &[&str] = &[
     "162.159.193.1",
     "162.159.195.1",
     "162.159.196.1",
 ];
 
-pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4443, 8443, 8095];
+// HTTP/3 uses UDP and may use the documented fallback ports. HTTP/2 uses the
+// documented TCP fallback on 443 only; probing every UDP fallback as TCP wastes
+// time and data without improving selection.
+pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
+pub const MASQUE_H2_PORTS: &[u16] = &[443];
 
-pub const MASQUE_CIDRS_V6: &[&str] = &[
-    "2606:4700:d0::/48",
-    "2606:4700:d1::/48",
-    "2606:4700:102::/48",
-];
+pub const MASQUE_CIDRS_V6: &[&str] = &["2606:4700:102::/48"];
+const MASQUE_COMPAT_CIDRS_V6: &[&str] = &["2606:4700:d0::/48", "2606:4700:d1::/48"];
 
 pub const MASQUE_SEEDS_V6: &[&str] = &[
+    "2606:4700:102::a29f:c001",
+    "2606:4700:102::a29f:c002",
+];
+
+const MASQUE_COMPAT_SEEDS_V6: &[&str] = &[
     "2606:4700:d0::a29f:c602",
     "2606:4700:d1::a29f:c602",
     "2606:4700:d0::a29f:c601",
-    "2606:4700:d0::a29f:c001",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +72,14 @@ struct ConfirmedResult {
     probe: ProbeResult,
     successes: usize,
     attempts: usize,
+    jitter: Duration,
     score: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RangeKey {
+    V4(u32),
+    V6(u128),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +90,8 @@ pub enum IpScan {
 }
 
 impl IpScan {
-    pub fn parse(s: &str) -> IpScan {
-        match s.trim().to_lowercase().as_str() {
+    pub fn parse(value: &str) -> IpScan {
+        match value.trim().to_lowercase().as_str() {
             "6" | "v6" | "ipv6" => IpScan::V6,
             "both" | "all" | "dual" => IpScan::Both,
             _ => IpScan::V4,
@@ -109,8 +125,8 @@ pub enum ScanMode {
 }
 
 impl ScanMode {
-    pub fn parse(s: &str) -> ScanMode {
-        match s.trim().to_lowercase().as_str() {
+    pub fn parse(value: &str) -> ScanMode {
+        match value.trim().to_lowercase().as_str() {
             "turbo" | "fast" => ScanMode::Turbo,
             "thorough" | "deep" | "pro" => ScanMode::Thorough,
             "stealth" | "quiet" => ScanMode::Stealth,
@@ -132,64 +148,69 @@ impl ScanMode {
     fn strategy(&self) -> Strategy {
         match self {
             ScanMode::Turbo => Strategy {
-                concurrency: 24,
-                per_probe_timeout: Duration::from_millis(4000),
-                overall_deadline: Duration::from_secs(25),
+                concurrency: 20,
+                per_probe_timeout: Duration::from_secs(4),
+                overall_deadline: Duration::from_secs(20),
                 settle_after_target: Duration::ZERO,
                 target_successes: 1,
                 early_exit_first: true,
-                full_subnet: false,
-                sample_per_cidr: 48,
+                sample_per_cidr: 24,
                 finalists: 1,
                 finalist_attempts: 1,
+                secondary_port_passes: 0,
+                include_compat_ranges: false,
             },
             ScanMode::Balanced => Strategy {
                 concurrency: 20,
-                per_probe_timeout: Duration::from_millis(5000),
-                overall_deadline: Duration::from_secs(60),
+                per_probe_timeout: Duration::from_secs(5),
+                overall_deadline: Duration::from_secs(50),
                 settle_after_target: Duration::from_secs(4),
                 target_successes: 12,
                 early_exit_first: false,
-                full_subnet: false,
-                sample_per_cidr: 96,
-                finalists: 5,
+                sample_per_cidr: 64,
+                finalists: 6,
                 finalist_attempts: 3,
+                secondary_port_passes: 1,
+                include_compat_ranges: false,
             },
             ScanMode::Thorough => Strategy {
                 concurrency: 24,
-                per_probe_timeout: Duration::from_millis(7000),
-                overall_deadline: Duration::from_secs(120),
+                per_probe_timeout: Duration::from_secs(7),
+                overall_deadline: Duration::from_secs(100),
                 settle_after_target: Duration::from_secs(8),
-                target_successes: 32,
+                target_successes: 28,
                 early_exit_first: false,
-                full_subnet: false,
-                sample_per_cidr: 160,
-                finalists: 8,
+                sample_per_cidr: 128,
+                finalists: 10,
                 finalist_attempts: 3,
+                secondary_port_passes: 2,
+                include_compat_ranges: true,
             },
             ScanMode::Stealth => Strategy {
                 concurrency: 3,
-                per_probe_timeout: Duration::from_millis(10000),
+                per_probe_timeout: Duration::from_secs(10),
                 overall_deadline: Duration::from_secs(120),
-                settle_after_target: Duration::from_secs(10),
-                target_successes: 8,
+                settle_after_target: Duration::from_secs(12),
+                target_successes: 6,
                 early_exit_first: false,
-                full_subnet: false,
-                sample_per_cidr: 64,
+                sample_per_cidr: 48,
                 finalists: 4,
                 finalist_attempts: 3,
+                secondary_port_passes: 0,
+                include_compat_ranges: false,
             },
             ScanMode::Ironclad => Strategy {
                 concurrency: 4,
-                per_probe_timeout: Duration::from_millis(12000),
-                overall_deadline: Duration::from_secs(150),
+                per_probe_timeout: Duration::from_secs(12),
+                overall_deadline: Duration::from_secs(140),
                 settle_after_target: Duration::from_secs(8),
                 target_successes: 6,
                 early_exit_first: false,
-                full_subnet: false,
-                sample_per_cidr: 96,
+                sample_per_cidr: 64,
                 finalists: 4,
                 finalist_attempts: 3,
+                secondary_port_passes: 1,
+                include_compat_ranges: true,
             },
         }
     }
@@ -205,10 +226,11 @@ struct Strategy {
     settle_after_target: Duration,
     target_successes: usize,
     early_exit_first: bool,
-    full_subnet: bool,
     sample_per_cidr: usize,
     finalists: usize,
     finalist_attempts: usize,
+    secondary_port_passes: usize,
+    include_compat_ranges: bool,
 }
 
 #[derive(Clone)]
@@ -227,7 +249,10 @@ pub struct MasqueProbe {
 
 pub async fn host_has_ipv6() -> bool {
     match tokio::net::UdpSocket::bind("[::]:0").await {
-        Ok(sock) => sock.connect("[2606:4700:d0::a29f:c001]:443").await.is_ok(),
+        Ok(socket) => socket
+            .connect("[2606:4700:102::a29f:c001]:443")
+            .await
+            .is_ok(),
         Err(_) => false,
     }
 }
@@ -248,14 +273,17 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
         }
     }
 
-    let candidates = build_candidates(&strategy, &probe.ports, effective_ip);
+    let active_ports = active_ports(probe);
+    let candidates = build_candidates(&strategy, &active_ports, effective_ip);
+    let range_count = candidate_range_count(&candidates);
 
     log::info!(
-        "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?} target={} finalists={} confirmations={}",
+        "[*] scan mode={} ip={} ranges={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?} target={} finalists={} confirmations={}",
         mode.label(),
         effective_ip.label(),
+        range_count,
         candidates.len(),
-        probe.ports,
+        active_ports,
         strategy.concurrency,
         strategy.per_probe_timeout,
         strategy.overall_deadline,
@@ -275,6 +303,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
 
     let deadline = Instant::now() + strategy.overall_deadline;
     let mut successful = Vec::new();
+    let mut completed = 0usize;
     let mut settle_until: Option<Instant> = None;
 
     loop {
@@ -284,63 +313,54 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
         let remaining = effective_deadline.saturating_duration_since(Instant::now());
 
         if remaining.is_zero() {
-            if successful.is_empty() {
-                log::warn!("[-] scan deadline reached with no gateway");
-            } else if settle_until.is_some() {
-                log::info!("[+] discovery settle window completed; confirming finalists");
-            } else {
-                log::warn!("[-] scan deadline reached; confirming discovered gateways");
-            }
             break;
         }
 
         tokio::select! {
             item = stream.next() => {
-                match item {
-                    None => break,
-                    Some(None) => continue,
-                    Some(Some(result)) => {
-                        log::info!(
-                            "[+] candidate ok {}:{} rtt={:?}",
-                            result.ip,
-                            result.port,
-                            result.rtt
-                        );
+                let Some(item) = item else { break };
+                completed = completed.saturating_add(1);
+                let Some(result) = item else { continue };
 
-                        if strategy.early_exit_first {
-                            return Ok(result);
-                        }
+                log::info!(
+                    "[+] candidate ok {}:{} rtt={:?}",
+                    result.ip,
+                    result.port,
+                    result.rtt
+                );
 
-                        successful.push(result);
+                if strategy.early_exit_first {
+                    return Ok(result);
+                }
 
-                        if strategy.target_successes > 0
-                            && successful.len() >= strategy.target_successes
-                            && settle_until.is_none()
-                        {
-                            log::info!(
-                                "[+] reached discovery target of {} gateways; observing for {:?} before confirmation",
-                                strategy.target_successes,
-                                strategy.settle_after_target
-                            );
+                successful.push(result);
 
-                            if strategy.settle_after_target.is_zero() {
-                                break;
-                            }
-                            settle_until = Some(Instant::now() + strategy.settle_after_target);
-                        }
+                if strategy.target_successes > 0
+                    && successful.len() >= strategy.target_successes
+                    && settle_until.is_none()
+                {
+                    log::info!(
+                        "[+] reached discovery target of {} gateways across {} ranges; observing for {:?}",
+                        strategy.target_successes,
+                        result_range_count(&successful),
+                        strategy.settle_after_target
+                    );
+                    if strategy.settle_after_target.is_zero() {
+                        break;
                     }
+                    settle_until = Some(Instant::now() + strategy.settle_after_target);
                 }
             }
-            _ = tokio::time::sleep(remaining) => {
-                if successful.is_empty() {
-                    log::warn!("[-] scan deadline reached with no gateway");
-                } else {
-                    log::info!("[+] discovery window completed; confirming finalists");
-                }
-                break;
-            }
+            _ = tokio::time::sleep(remaining) => break,
         }
     }
+
+    log::info!(
+        "[*] discovery completed attempts={} successes={} successful_ranges={}",
+        completed,
+        successful.len(),
+        result_range_count(&successful)
+    );
 
     if successful.is_empty() {
         return Err(AetherError::NoCleanEndpoint);
@@ -348,14 +368,10 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
 
     successful.sort_by_key(|result| result.rtt);
     let discovery_best = successful[0];
-    let finalist_count = strategy.finalists.max(1).min(successful.len());
-    let finalists = successful
-        .into_iter()
-        .take(finalist_count)
-        .collect::<Vec<_>>();
+    let finalists = select_diverse_finalists(successful, strategy.finalists);
 
     log::info!(
-        "[*] confirming {} finalist gateways with {} total measurements each",
+        "[*] confirming {} range-diverse finalists with {} total measurements each",
         finalists.len(),
         strategy.finalist_attempts
     );
@@ -377,10 +393,11 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     while let Some(result) = confirmation_stream.next().await {
         if let Some(result) = result {
             log::info!(
-                "[+] finalist {}:{} median={:?} reliability={}/{} score={:?}",
+                "[+] finalist {}:{} median={:?} jitter={:?} reliability={}/{} score={:?}",
                 result.probe.ip,
                 result.probe.port,
                 result.probe.rtt,
+                result.jitter,
                 result.successes,
                 result.attempts,
                 result.score
@@ -391,7 +408,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
 
     if confirmed.is_empty() {
         log::warn!(
-            "[-] no finalist passed repeated confirmation; falling back to discovery best {}:{} rtt={:?}",
+            "[-] no finalist passed repeated confirmation; using discovery best {}:{} rtt={:?}",
             discovery_best.ip,
             discovery_best.port,
             discovery_best.rtt
@@ -408,15 +425,63 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
 
     let selected = confirmed[0];
     log::info!(
-        "[+] best gateway {}:{} median_rtt={:?} reliability={}/{} score={:?}",
+        "[+] best gateway {}:{} median_rtt={:?} jitter={:?} reliability={}/{} score={:?}",
         selected.probe.ip,
         selected.probe.port,
         selected.probe.rtt,
+        selected.jitter,
         selected.successes,
         selected.attempts,
         selected.score
     );
     Ok(selected.probe)
+}
+
+fn active_ports(probe: &MasqueProbe) -> Vec<u16> {
+    let preferred = if crate::masque_h2::enabled() {
+        MASQUE_H2_PORTS
+    } else {
+        MASQUE_PORTS
+    };
+    let allowed: HashSet<u16> = probe.ports.iter().copied().filter(|port| *port != 0).collect();
+    let mut output = preferred
+        .iter()
+        .copied()
+        .filter(|port| allowed.is_empty() || allowed.contains(port))
+        .collect::<Vec<_>>();
+    if output.is_empty() {
+        output.extend_from_slice(preferred);
+    }
+    output
+}
+
+fn select_diverse_finalists(mut successful: Vec<ProbeResult>, limit: usize) -> Vec<ProbeResult> {
+    successful.sort_by_key(|result| result.rtt);
+    let limit = limit.max(1).min(successful.len());
+    let mut output = Vec::with_capacity(limit);
+    let mut selected_endpoints = HashSet::new();
+    let mut selected_ranges = HashSet::new();
+
+    for result in &successful {
+        if selected_ranges.insert(range_key(result.ip))
+            && selected_endpoints.insert((result.ip, result.port))
+        {
+            output.push(*result);
+            if output.len() == limit {
+                return output;
+            }
+        }
+    }
+
+    for result in successful {
+        if selected_endpoints.insert((result.ip, result.port)) {
+            output.push(result);
+            if output.len() == limit {
+                break;
+            }
+        }
+    }
+    output
 }
 
 async fn confirm_candidate(
@@ -432,8 +497,7 @@ async fn confirm_candidate(
     samples.push(candidate.rtt);
 
     for _ in 1..attempts {
-        if let Some(result) =
-            verify_one(probe, candidate.ip, candidate.port, timeout, ironclad).await
+        if let Some(result) = verify_one(probe, candidate.ip, candidate.port, timeout, ironclad).await
         {
             samples.push(result.rtt);
         }
@@ -453,11 +517,20 @@ async fn confirm_candidate(
 
     samples.sort();
     let median = samples[samples.len() / 2];
+    let jitter = samples
+        .last()
+        .copied()
+        .unwrap_or(median)
+        .saturating_sub(samples.first().copied().unwrap_or(median));
     let failures = attempts.saturating_sub(successes) as u32;
-    let penalty = FAILED_CONFIRMATION_PENALTY
+    let failure_penalty = FAILED_CONFIRMATION_PENALTY
         .checked_mul(failures)
         .unwrap_or(Duration::MAX);
-    let score = median.checked_add(penalty).unwrap_or(Duration::MAX);
+    let jitter_penalty = duration_half(jitter);
+    let score = median
+        .checked_add(failure_penalty)
+        .and_then(|value| value.checked_add(jitter_penalty))
+        .unwrap_or(Duration::MAX);
 
     Some(ConfirmedResult {
         probe: ProbeResult {
@@ -467,6 +540,7 @@ async fn confirm_candidate(
         },
         successes,
         attempts,
+        jitter,
         score,
     })
 }
@@ -492,15 +566,9 @@ async fn verify_one(
             local_ipv6_str: String::new(),
         };
         return match crate::tunnelping::masque_http_ping(&params, IRONCLAD_TCPING_TIMEOUT).await {
-            Ok(rtt) => {
-                log::info!(
-                    "[+] ironclad verified {ip}:{port} real http round trip rtt={:?}",
-                    rtt
-                );
-                Some(ProbeResult { ip, port, rtt })
-            }
+            Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
             Err(error) => {
-                log::trace!("[-] ironclad {ip}:{port} failed real http check: {error}");
+                log::trace!("[-] ironclad {ip}:{port} failed real HTTP check: {error}");
                 None
             }
         };
@@ -554,123 +622,217 @@ async fn verify_one(
 }
 
 fn build_candidates(strategy: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
-    let primary = ports.first().copied().unwrap_or(443);
-    let mut candidates = Vec::new();
+    let ports = dedupe_ports(ports, 443);
+    let primary_port = ports[0];
+    let mut anchors = Vec::new();
+    let mut pool = Vec::new();
+
+    if ip.want_v4() {
+        for seed in MASQUE_SEEDS {
+            if let Ok(address) = seed.parse::<Ipv4Addr>() {
+                anchors.push(IpAddr::V4(address));
+            }
+        }
+        if strategy.include_compat_ranges {
+            for seed in MASQUE_COMPAT_SEEDS {
+                if let Ok(address) = seed.parse::<Ipv4Addr>() {
+                    anchors.push(IpAddr::V4(address));
+                }
+            }
+        }
+
+        let ranges = configured_v4_ranges(strategy.include_compat_ranges);
+        let sampled = ranges
+            .iter()
+            .map(|range| sample_cidr_v4(range, strategy.sample_per_cidr))
+            .collect::<Vec<_>>();
+        interleave_v4(&sampled, &mut pool);
+    }
+
+    if ip.want_v6() {
+        for seed in MASQUE_SEEDS_V6 {
+            if let Ok(address) = seed.parse::<Ipv6Addr>() {
+                anchors.push(IpAddr::V6(address));
+            }
+        }
+        if strategy.include_compat_ranges {
+            for seed in MASQUE_COMPAT_SEEDS_V6 {
+                if let Ok(address) = seed.parse::<Ipv6Addr>() {
+                    anchors.push(IpAddr::V6(address));
+                }
+            }
+        }
+
+        let ranges = configured_v6_ranges(strategy.include_compat_ranges);
+        let sampled = ranges
+            .iter()
+            .map(|range| sample_cidr_v6(range, strategy.sample_per_cidr))
+            .collect::<Vec<_>>();
+        interleave_v6(&sampled, &mut pool);
+    }
+
+    let mut output = Vec::new();
     let mut seen = HashSet::new();
 
-    let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS
+    for port in &ports {
+        for address in &anchors {
+            if seen.insert((*address, *port)) {
+                output.push((*address, *port));
+            }
+        }
+    }
+
+    for address in &pool {
+        if seen.insert((*address, primary_port)) {
+            output.push((*address, primary_port));
+        }
+    }
+
+    let secondary_ports = ports.iter().copied().skip(1).collect::<Vec<_>>();
+    if !secondary_ports.is_empty() {
+        for pass in 0..strategy.secondary_port_passes {
+            for (index, address) in pool.iter().enumerate() {
+                let port = secondary_ports[(index + pass) % secondary_ports.len()];
+                if seen.insert((*address, port)) {
+                    output.push((*address, port));
+                }
+            }
+        }
+    }
+
+    output
+}
+
+fn configured_v4_ranges(include_compat: bool) -> Vec<String> {
+    let mut ranges = MASQUE_CIDRS_V4
         .iter()
-        .filter_map(|seed| seed.parse().ok())
-        .collect();
-    let seeds_v6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    if include_compat {
+        ranges.extend(
+            MASQUE_COMPAT_CIDRS_V4
+                .iter()
+                .map(|value| (*value).to_string()),
+        );
+        ranges.extend(extra_ranges("AETHER_MASQUE_EXTRA_CIDRS", false));
+    }
+    ranges
+}
+
+fn configured_v6_ranges(include_compat: bool) -> Vec<String> {
+    let mut ranges = MASQUE_CIDRS_V6
         .iter()
-        .filter_map(|seed| seed.parse().ok())
-        .collect();
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    if include_compat {
+        ranges.extend(
+            MASQUE_COMPAT_CIDRS_V6
+                .iter()
+                .map(|value| (*value).to_string()),
+        );
+        ranges.extend(extra_ranges("AETHER_MASQUE_EXTRA_CIDRS", true));
+    }
+    ranges
+}
 
-    if ip.want_v4() {
-        for address in &seeds {
-            if seen.insert((IpAddr::V4(*address), primary)) {
-                candidates.push((IpAddr::V4(*address), primary));
+fn extra_ranges(name: &str, ipv6: bool) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|entry| {
+            if ipv6 {
+                parse_cidr_v6(entry)
+                    .map(|(_, prefix)| prefix >= 32)
+                    .unwrap_or(false)
+            } else {
+                parse_cidr_v4(entry)
+                    .map(|(_, prefix)| prefix >= 20)
+                    .unwrap_or(false)
             }
-        }
+        })
+        .collect()
+}
 
-        let cidr_hosts: Vec<Vec<Ipv4Addr>> = MASQUE_CIDRS_V4
-            .iter()
-            .map(|cidr| {
-                if strategy.full_subnet {
-                    enumerate_cidr_v4(cidr)
-                } else {
-                    sample_cidr_v4(cidr, strategy.sample_per_cidr)
-                }
-            })
-            .collect();
-        let max_length = cidr_hosts.iter().map(Vec::len).max().unwrap_or(0);
-        for index in 0..max_length {
-            for hosts in &cidr_hosts {
-                if let Some(address) = hosts.get(index) {
-                    if seen.insert((IpAddr::V4(*address), primary)) {
-                        candidates.push((IpAddr::V4(*address), primary));
-                    }
-                }
+fn dedupe_ports(ports: &[u16], fallback: u16) -> Vec<u16> {
+    let mut seen = HashSet::new();
+    let output = ports
+        .iter()
+        .copied()
+        .filter(|port| *port != 0 && seen.insert(*port))
+        .collect::<Vec<_>>();
+    if output.is_empty() {
+        vec![fallback]
+    } else {
+        output
+    }
+}
+
+fn interleave_v4(groups: &[Vec<Ipv4Addr>], output: &mut Vec<IpAddr>) {
+    let max_len = groups.iter().map(Vec::len).max().unwrap_or(0);
+    for index in 0..max_len {
+        for group in groups {
+            if let Some(address) = group.get(index) {
+                output.push(IpAddr::V4(*address));
             }
         }
     }
+}
 
-    if ip.want_v6() {
-        for address in &seeds_v6 {
-            if seen.insert((IpAddr::V6(*address), primary)) {
-                candidates.push((IpAddr::V6(*address), primary));
-            }
-        }
-
-        let per_cidr = if strategy.sample_per_cidr == 0 {
-            96
-        } else {
-            strategy.sample_per_cidr
-        };
-        let cidr_hosts: Vec<Vec<Ipv6Addr>> = MASQUE_CIDRS_V6
-            .iter()
-            .map(|cidr| sample_cidr_v6(cidr, per_cidr, MASQUE_CIDRS_V4))
-            .collect();
-        let max_length = cidr_hosts.iter().map(Vec::len).max().unwrap_or(0);
-        for index in 0..max_length {
-            for hosts in &cidr_hosts {
-                if let Some(address) = hosts.get(index) {
-                    if seen.insert((IpAddr::V6(*address), primary)) {
-                        candidates.push((IpAddr::V6(*address), primary));
-                    }
-                }
+fn interleave_v6(groups: &[Vec<Ipv6Addr>], output: &mut Vec<IpAddr>) {
+    let max_len = groups.iter().map(Vec::len).max().unwrap_or(0);
+    for index in 0..max_len {
+        for group in groups {
+            if let Some(address) = group.get(index) {
+                output.push(IpAddr::V6(*address));
             }
         }
     }
+}
 
-    if ip.want_v4() {
-        for address in &seeds {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V4(*address), port)) {
-                    candidates.push((IpAddr::V4(*address), port));
-                }
-            }
-        }
-    }
-
-    if ip.want_v6() {
-        for address in &seeds_v6 {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V6(*address), port)) {
-                    candidates.push((IpAddr::V6(*address), port));
-                }
-            }
-        }
-    }
-
+fn candidate_range_count(candidates: &[(IpAddr, u16)]) -> usize {
     candidates
+        .iter()
+        .map(|(ip, _)| range_key(*ip))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn result_range_count(results: &[ProbeResult]) -> usize {
+    results
+        .iter()
+        .map(|result| range_key(result.ip))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn range_key(ip: IpAddr) -> RangeKey {
+    match ip {
+        IpAddr::V4(address) => RangeKey::V4(u32::from(address) & 0xffff_ff00),
+        IpAddr::V6(address) => RangeKey::V6(u128::from(address) & (u128::MAX << 80)),
+    }
 }
 
 fn parse_cidr_v4(cidr: &str) -> Option<(u32, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((
-        u32::from(ip.parse::<Ipv4Addr>().ok()?),
-        prefix.parse().ok()?,
-    ))
-}
-
-fn enumerate_cidr_v4(cidr: &str) -> Vec<Ipv4Addr> {
-    let (base, prefix) = match parse_cidr_v4(cidr) {
-        Some(value) => value,
-        None => return Vec::new(),
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let address = u32::from(ip.parse::<Ipv4Addr>().ok()?);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
     };
-    let host_bits = 32u32.saturating_sub(prefix as u32);
-    if host_bits == 0 {
-        return vec![Ipv4Addr::from(base)];
-    }
-    if host_bits > 12 {
-        return Vec::new();
-    }
-    let size = 1u32 << host_bits;
-    (1..size.saturating_sub(1))
-        .map(|offset| Ipv4Addr::from(base + offset))
-        .collect()
+    Some((address & mask, prefix))
 }
 
 fn sample_cidr_v4(cidr: &str, count: usize) -> Vec<Ipv4Addr> {
@@ -679,6 +841,9 @@ fn sample_cidr_v4(cidr: &str, count: usize) -> Vec<Ipv4Addr> {
         None => return Vec::new(),
     };
     let host_bits = 32u32.saturating_sub(prefix as u32);
+    if host_bits == 0 {
+        return vec![Ipv4Addr::from(base)];
+    }
     let size = if host_bits >= 32 {
         u32::MAX
     } else {
@@ -690,59 +855,97 @@ fn sample_cidr_v4(cidr: &str, count: usize) -> Vec<Ipv4Addr> {
 
     let usable = size - 2;
     let wanted = (count as u32).min(usable);
-    let mut random = rand::thread_rng();
+    let mut rng = rand::thread_rng();
     let mut chosen = HashSet::with_capacity(wanted as usize);
-    let mut addresses = Vec::with_capacity(wanted as usize);
+    let mut output = Vec::with_capacity(wanted as usize);
 
-    while (addresses.len() as u32) < wanted {
-        let offset = 1 + random.gen_range(0..usable);
+    while (output.len() as u32) < wanted {
+        let offset = 1 + rng.gen_range(0..usable);
         if chosen.insert(offset) {
-            addresses.push(Ipv4Addr::from(base + offset));
+            output.push(Ipv4Addr::from(base.saturating_add(offset)));
         }
     }
-
-    addresses
+    output
 }
 
 fn parse_cidr_v6(cidr: &str) -> Option<(u128, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((
-        u128::from(ip.parse::<Ipv6Addr>().ok()?),
-        prefix.parse().ok()?,
-    ))
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 128 {
+        return None;
+    }
+    let address = u128::from(ip.parse::<Ipv6Addr>().ok()?);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    Some((address & mask, prefix))
 }
 
-fn sample_cidr_v6(cidr: &str, count: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
+fn sample_cidr_v6(cidr: &str, count: usize) -> Vec<Ipv6Addr> {
     let (base, prefix) = match parse_cidr_v6(cidr) {
         Some(value) => value,
         None => return Vec::new(),
     };
-    if 128u32.saturating_sub(prefix as u32) == 0 {
+    let host_bits = 128u32.saturating_sub(prefix as u32);
+    if host_bits == 0 {
         return vec![Ipv6Addr::from(base)];
     }
+    let host_mask = if host_bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << host_bits) - 1
+    };
+    let mut rng = rand::thread_rng();
+    let mut chosen = HashSet::with_capacity(count);
+    let mut output = Vec::with_capacity(count);
 
-    let v4_ranges: Vec<(u32, u8)> = v4_cidrs
-        .iter()
-        .filter_map(|cidr| parse_cidr_v4(cidr))
-        .collect();
-    let mut random = rand::thread_rng();
-    let mut addresses = Vec::with_capacity(count);
+    while output.len() < count {
+        let host = rng.gen::<u128>() & host_mask;
+        if chosen.insert(host) {
+            output.push(Ipv6Addr::from(base | host));
+        }
+    }
+    output
+}
 
-    for _ in 0..count {
-        let embedded = if v4_ranges.is_empty() {
-            random.gen::<u32>() as u128
-        } else {
-            let (network, prefix) = v4_ranges[random.gen_range(0..v4_ranges.len())];
-            let host_bits = 32u32.saturating_sub(prefix as u32);
-            let host = if host_bits == 0 {
-                0
-            } else {
-                random.gen::<u32>() & ((1u32 << host_bits) - 1)
-            };
-            (network | host) as u128
-        };
-        addresses.push(Ipv6Addr::from(base | embedded));
+fn duration_half(value: Duration) -> Duration {
+    let nanos = (value.as_nanos() / 2).min(u64::MAX as u128) as u64;
+    Duration::from_nanos(nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalists_cover_distinct_ranges_before_duplicates() {
+        let results = vec![
+            ProbeResult {
+                ip: "162.159.198.10".parse().unwrap(),
+                port: 443,
+                rtt: Duration::from_millis(10),
+            },
+            ProbeResult {
+                ip: "162.159.198.11".parse().unwrap(),
+                port: 443,
+                rtt: Duration::from_millis(11),
+            },
+            ProbeResult {
+                ip: "162.159.197.10".parse().unwrap(),
+                port: 443,
+                rtt: Duration::from_millis(20),
+            },
+        ];
+        let selected = select_diverse_finalists(results, 2);
+        assert_eq!(result_range_count(&selected), 2);
     }
 
-    addresses
+    #[test]
+    fn invalid_extra_ranges_are_rejected() {
+        assert!(parse_cidr_v4("162.159.197.0/24").is_some());
+        assert!(parse_cidr_v4("162.159.197.0/33").is_none());
+        assert!(parse_cidr_v6("2606:4700:102::/48").is_some());
+    }
 }

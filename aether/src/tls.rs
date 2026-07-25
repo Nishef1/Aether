@@ -64,14 +64,15 @@ fn spki_sha256(cert: &boring::x509::X509Ref) -> Option<[u8; 32]> {
 fn log_pin_mismatch_once(hash: [u8; 32]) {
     let hashes = REJECTED_SPKI_HASHES.get_or_init(|| Mutex::new(HashSet::new()));
     match hashes.lock() {
-        Ok(mut seen) if seen.insert(hash) => {
-            log::warn!(
-                "tls pin: server cert SPKI hash {:02x?} does not match any pinned hash",
-                hash
-            );
-        }
-        Ok(_) => {
-            log::trace!("tls pin: repeated rejected SPKI hash {:02x?}", hash);
+        Ok(mut seen) => {
+            if seen.insert(hash) {
+                log::warn!(
+                    "tls pin: server cert SPKI hash {:02x?} does not match any pinned hash",
+                    hash
+                );
+            } else {
+                log::trace!("tls pin: repeated rejected SPKI hash {:02x?}", hash);
+            }
         }
         Err(_) => {
             log::debug!("tls pin: rejected SPKI hash (dedup state unavailable)");

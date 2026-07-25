@@ -4,6 +4,11 @@ version = "1.4.0"
 edition = "2021"
 rust-version = "1.88"
 
+[lib]
+name = "aether_core"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
 [dependencies]
 quiche = { path = "../quiche/quiche", default-features = false, features = ["boringssl-boring-crate", "qlog"] }
 boring = "4.22"

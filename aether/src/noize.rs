@@ -1,9 +1,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rand::Rng;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use tokio::net::UdpSocket;
+
+const MAX_JUNK_PACKETS: usize = 32;
+const MIN_JUNK_SIZE: usize = 1;
+const MAX_JUNK_SIZE: usize = 1200;
+const MAX_SIGNATURE_BYTES: usize = 2048;
+const MAX_JUNK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct NoizeConfig {
@@ -56,6 +61,17 @@ impl NoizeConfig {
     pub fn is_enabled(&self) -> bool {
         self.jc_before_hs > 0 || self.jc_after_i1 > 0 || self.i1.is_some()
     }
+
+    fn bounded_counts(&self) -> (usize, usize) {
+        (
+            self.jc_before_hs.min(MAX_JUNK_PACKETS),
+            self.jc_after_i1.min(MAX_JUNK_PACKETS),
+        )
+    }
+
+    fn bounded_interval(&self) -> Duration {
+        self.junk_interval.min(MAX_JUNK_INTERVAL)
+    }
 }
 
 pub fn from_profile(name: &str) -> NoizeConfig {
@@ -66,120 +82,168 @@ pub fn from_profile(name: &str) -> NoizeConfig {
     }
 }
 
-fn junk_packet(cfg: &NoizeConfig) -> Vec<u8> {
+fn junk_packet(config: &NoizeConfig) -> Vec<u8> {
     let mut rng = rand::thread_rng();
-    let (lo, hi) = if cfg.jmax > cfg.jmin && cfg.jmin > 0 {
-        (cfg.jmin, cfg.jmax)
-    } else {
-        (40, 90)
-    };
-    let size = rng.gen_range(lo..=hi);
-    let mut buf = vec![0u8; size];
-    rand::thread_rng().fill_bytes(&mut buf);
-    buf
+    let low = config.jmin.clamp(MIN_JUNK_SIZE, MAX_JUNK_SIZE);
+    let high = config
+        .jmax
+        .clamp(MIN_JUNK_SIZE, MAX_JUNK_SIZE)
+        .max(low);
+    let size = rng.gen_range(low..=high);
+    let mut buffer = vec![0u8; size];
+    rng.fill_bytes(&mut buffer);
+    buffer
 }
 
 fn parse_cps(spec: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut output = Vec::new();
     let bytes = spec.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
+    let mut index = 0;
+    while index < bytes.len() && output.len() < MAX_SIGNATURE_BYTES {
+        if bytes[index] != b'<' {
+            index += 1;
             continue;
         }
-        let end = match spec[i..].find('>') {
-            Some(e) => i + e,
+        let end = match spec[index..].find('>') {
+            Some(relative) => index + relative,
             None => break,
         };
-        let inner = spec[i + 1..end].trim();
+        let inner = spec[index + 1..end].trim();
         let mut parts = inner.splitn(2, char::is_whitespace);
         let tag = parts.next().unwrap_or("");
         let data = parts.next().unwrap_or("").trim();
 
         match tag {
             "b" => {
-                let hexstr: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-                if let Ok(decoded) = hex::decode(&hexstr) {
-                    out.extend_from_slice(&decoded);
+                let hex: String = data.chars().filter(|value| !value.is_whitespace()).collect();
+                if let Ok(decoded) = hex::decode(&hex) {
+                    let remaining = MAX_SIGNATURE_BYTES.saturating_sub(output.len());
+                    output.extend_from_slice(&decoded[..decoded.len().min(remaining)]);
                 }
-            },
+            }
             "t" => {
-                let ts = std::time::SystemTime::now()
+                let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
+                    .map(|duration| duration.as_secs() as u32)
                     .unwrap_or(0);
-                out.extend_from_slice(&ts.to_be_bytes());
-            },
+                output.extend_from_slice(&timestamp.to_be_bytes());
+            }
             "n" => {
                 let nonce: u64 = rand::random();
-                out.extend_from_slice(&nonce.to_be_bytes());
-            },
+                output.extend_from_slice(&nonce.to_be_bytes());
+            }
             "r" => {
-                let len: usize = data.parse().unwrap_or(0).min(1024);
-                if len > 0 {
-                    let mut r = vec![0u8; len];
-                    rand::thread_rng().fill_bytes(&mut r);
-                    out.extend_from_slice(&r);
+                let requested: usize = data.parse().unwrap_or(0);
+                let remaining = MAX_SIGNATURE_BYTES.saturating_sub(output.len());
+                let length = requested.min(MAX_SIGNATURE_BYTES).min(remaining);
+                if length > 0 {
+                    let mut random = vec![0u8; length];
+                    rand::thread_rng().fill_bytes(&mut random);
+                    output.extend_from_slice(&random);
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
 
-        i = end + 1;
+        output.truncate(MAX_SIGNATURE_BYTES);
+        index = end + 1;
     }
-    out
+    output
 }
 
-pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig) {
-    if !cfg.is_enabled() {
+async fn send_packet(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    packet: &[u8],
+    label: &str,
+) -> bool {
+    match socket.send_to(packet, peer).await {
+        Ok(written) => {
+            log::trace!("{label} sent {written} bytes");
+            true
+        }
+        Err(error) => {
+            log::debug!("{label} send failed: {error}");
+            false
+        }
+    }
+}
+
+pub async fn pre_handshake(socket: &UdpSocket, peer: SocketAddr, config: &NoizeConfig) {
+    if !config.is_enabled() {
         return;
     }
 
-    log::trace!("sending {} junk packets before handshake", cfg.jc_before_hs);
+    let (before_count, after_count) = config.bounded_counts();
+    let interval = config.bounded_interval();
+    log::trace!("sending {before_count} bounded junk packets before handshake");
 
-    for i in 0..cfg.jc_before_hs {
-        let pkt = junk_packet(cfg);
-        match sock.send_to(&pkt, peer).await {
-            Ok(n) => log::trace!("junk[{i}] sent {n} bytes"),
-            Err(e) => log::debug!("junk[{i}] send failed: {e}"),
+    for index in 0..before_count {
+        let packet = junk_packet(config);
+        if !send_packet(socket, peer, &packet, &format!("junk[{index}]")).await {
+            return;
         }
-        if !cfg.junk_interval.is_zero() {
-            tokio::time::sleep(cfg.junk_interval).await;
+        if !interval.is_zero() {
+            tokio::time::sleep(interval).await;
         }
     }
 
-    if let Some(i1) = &cfg.i1 {
-        let pkt = parse_cps(i1);
-        if !pkt.is_empty() {
-            match sock.send_to(&pkt, peer).await {
-                Ok(n) => log::trace!("signature i1 sent {n} bytes"),
-                Err(e) => log::debug!("signature i1 send failed: {e}"),
+    if let Some(signature) = &config.i1 {
+        let packet = parse_cps(signature);
+        if !packet.is_empty() {
+            if !send_packet(socket, peer, &packet, "signature i1").await {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
 
-    for i in 0..cfg.jc_after_i1 {
-        let pkt = junk_packet(cfg);
-        match sock.send_to(&pkt, peer).await {
-            Ok(n) => log::trace!("junk_after[{i}] sent {n} bytes"),
-            Err(e) => log::debug!("junk_after[{i}] send failed: {e}"),
+    for index in 0..after_count {
+        let packet = junk_packet(config);
+        if !send_packet(
+            socket,
+            peer,
+            &packet,
+            &format!("junk_after[{index}]"),
+        )
+        .await
+        {
+            return;
         }
-        if !cfg.junk_interval.is_zero() {
-            tokio::time::sleep(cfg.junk_interval).await;
+        if !interval.is_zero() {
+            tokio::time::sleep(interval).await;
         }
     }
 
-    if let Some(i2) = &cfg.i2 {
-        let pkt = parse_cps(i2);
-        if !pkt.is_empty() {
-            match sock.send_to(&pkt, peer).await {
-                Ok(n) => log::trace!("signature i2 sent {n} bytes"),
-                Err(e) => log::debug!("signature i2 send failed: {e}"),
-            }
+    if let Some(signature) = &config.i2 {
+        let packet = parse_cps(signature);
+        if !packet.is_empty() {
+            let _ = send_packet(socket, peer, &packet, "signature i2").await;
         }
     }
 
     log::trace!("obfuscation pre-handshake complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn junk_sizes_and_signatures_are_bounded() {
+        let mut config = NoizeConfig::firewall();
+        config.jmin = 0;
+        config.jmax = usize::MAX;
+        let packet = junk_packet(&config);
+        assert!((MIN_JUNK_SIZE..=MAX_JUNK_SIZE).contains(&packet.len()));
+        assert_eq!(parse_cps("<r 999999>").len(), MAX_SIGNATURE_BYTES);
+    }
+
+    #[test]
+    fn packet_counts_are_bounded() {
+        let mut config = NoizeConfig::firewall();
+        config.jc_before_hs = usize::MAX;
+        config.jc_after_i1 = usize::MAX;
+        assert_eq!(config.bounded_counts(), (MAX_JUNK_PACKETS, MAX_JUNK_PACKETS));
+    }
 }

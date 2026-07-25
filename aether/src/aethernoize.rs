@@ -1,9 +1,16 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::{Rng, RngCore};
 use regex::Regex;
 use tokio::net::UdpSocket;
+
+const MAX_TRACKED_SOCKETS: usize = 1024;
+
+static POST_HANDSHAKE_SENT: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
+static KEEPALIVE_ACTIVE: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct AetherNoizeConfig {
@@ -132,12 +139,12 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
     let tag_regex = Regex::new(r"<([a-z]+)\s*([^>]*)>").unwrap();
 
     for cap in tag_regex.captures_iter(spec) {
-        let tag_type = cap.get(1).map_or("", |m| m.as_str());
-        let tag_data = cap.get(2).map_or("", |m| m.as_str()).trim();
+        let tag_type = cap.get(1).map_or("", |value| value.as_str());
+        let tag_data = cap.get(2).map_or("", |value| value.as_str()).trim();
 
         match tag_type {
             "b" => {
-                let hex_str: String = tag_data.chars().filter(|c| !c.is_whitespace()).collect();
+                let hex_str: String = tag_data.chars().filter(|value| !value.is_whitespace()).collect();
                 let clean = hex_str
                     .strip_prefix("0x")
                     .or_else(|| hex_str.strip_prefix("0X"))
@@ -147,16 +154,16 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
                 }
             }
             "t" => {
-                let ts = SystemTime::now()
+                let timestamp = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
+                    .map(|duration| duration.as_secs() as u32)
                     .unwrap_or(0);
-                out.extend_from_slice(&ts.to_be_bytes());
+                out.extend_from_slice(&timestamp.to_be_bytes());
             }
             "c" => {
                 let counter = (SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
+                    .map(|duration| duration.as_secs())
                     .unwrap_or(0)
                     % 0xFFFFFFFF) as u32;
                 out.extend_from_slice(&counter.to_be_bytes());
@@ -164,31 +171,31 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
             "r" => {
                 let len = parse_range(tag_data);
                 if len > 0 {
-                    let mut r = vec![0u8; len];
-                    rand::thread_rng().fill_bytes(&mut r);
-                    out.extend_from_slice(&r);
+                    let mut random = vec![0u8; len];
+                    rand::thread_rng().fill_bytes(&mut random);
+                    out.extend_from_slice(&random);
                 }
             }
             "rc" => {
                 let len = parse_range(tag_data);
                 if len > 0 {
                     let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-                    let mut r = vec![0u8; len];
-                    for b in r.iter_mut() {
-                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
+                    let mut random = vec![0u8; len];
+                    for byte in random.iter_mut() {
+                        *byte = chars[rand::thread_rng().gen_range(0..chars.len())];
                     }
-                    out.extend_from_slice(&r);
+                    out.extend_from_slice(&random);
                 }
             }
             "rd" => {
                 let len = parse_range(tag_data);
                 if len > 0 {
                     let chars = b"0123456789";
-                    let mut r = vec![0u8; len];
-                    for b in r.iter_mut() {
-                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
+                    let mut random = vec![0u8; len];
+                    for byte in random.iter_mut() {
+                        *byte = chars[rand::thread_rng().gen_range(0..chars.len())];
                     }
-                    out.extend_from_slice(&r);
+                    out.extend_from_slice(&random);
                 }
             }
             _ => {}
@@ -256,7 +263,11 @@ fn generate_junk(cfg: &AetherNoizeConfig) -> Vec<u8> {
     };
 
     if size == 0 {
-        return if cfg.allow_zero_size { vec![] } else { vec![0x00] };
+        return if cfg.allow_zero_size {
+            vec![]
+        } else {
+            vec![0x00]
+        };
     }
 
     let mut junk = vec![0u8; size];
@@ -264,8 +275,41 @@ fn generate_junk(cfg: &AetherNoizeConfig) -> Vec<u8> {
     junk
 }
 
-async fn send_connected(sock: &UdpSocket, pkt: &[u8]) {
-    let _ = sock.send(pkt).await;
+async fn send_connected(sock: &UdpSocket, packet: &[u8]) -> bool {
+    match sock.send(packet).await {
+        Ok(_) => true,
+        Err(error) => {
+            log::debug!("aethernoize send failed: {error}");
+            false
+        }
+    }
+}
+
+fn insert_bounded_once(
+    state: &'static OnceLock<Mutex<HashSet<SocketAddr>>>,
+    address: SocketAddr,
+) -> bool {
+    let state = state.get_or_init(|| Mutex::new(HashSet::new()));
+    match state.lock() {
+        Ok(mut tracked) => {
+            if tracked.len() >= MAX_TRACKED_SOCKETS {
+                tracked.clear();
+            }
+            tracked.insert(address)
+        }
+        Err(_) => false,
+    }
+}
+
+fn remove_tracked(
+    state: &'static OnceLock<Mutex<HashSet<SocketAddr>>>,
+    address: SocketAddr,
+) {
+    if let Some(state) = state.get() {
+        if let Ok(mut tracked) = state.lock() {
+            tracked.remove(&address);
+        }
+    }
 }
 
 pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &AetherNoizeConfig) {
@@ -277,14 +321,18 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
         let payload = parse_cps(i1);
         if !payload.is_empty() {
             let framed = wrap_ikev2(&payload);
-            send_connected(sock, &framed).await;
+            if !send_connected(sock, &framed).await {
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
 
     for _ in 0..cfg.jc_after_i1 {
         let junk = generate_junk(cfg);
-        send_connected(sock, &junk).await;
+        if !send_connected(sock, &junk).await {
+            return;
+        }
         if !cfg.junk_interval.is_zero() {
             tokio::time::sleep(cfg.junk_interval).await;
         }
@@ -292,17 +340,21 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
 
     for _ in 0..cfg.jc_before_hs {
         let junk = generate_junk(cfg);
-        send_connected(sock, &junk).await;
+        if !send_connected(sock, &junk).await {
+            return;
+        }
         if !cfg.junk_interval.is_zero() {
             tokio::time::sleep(cfg.junk_interval).await;
         }
     }
 
-    for sig in [&cfg.i2, &cfg.i3, &cfg.i4, &cfg.i5].iter() {
-        if let Some(s) = sig {
-            let pkt = parse_cps(s);
-            if !pkt.is_empty() {
-                send_connected(sock, &pkt).await;
+    for signature in [&cfg.i2, &cfg.i3, &cfg.i4, &cfg.i5].iter() {
+        if let Some(spec) = signature {
+            let packet = parse_cps(spec);
+            if !packet.is_empty() {
+                if !send_connected(sock, &packet).await {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
@@ -313,10 +365,27 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
     }
 }
 
-pub async fn send_post_handshake_junk(sock: &UdpSocket, _peer: SocketAddr, cfg: &AetherNoizeConfig) {
+pub async fn send_post_handshake_junk(
+    sock: &UdpSocket,
+    _peer: SocketAddr,
+    cfg: &AetherNoizeConfig,
+) {
+    if cfg.jc_after_hs == 0 {
+        return;
+    }
+
+    let Ok(local_address) = sock.local_addr() else {
+        return;
+    };
+    if !insert_bounded_once(&POST_HANDSHAKE_SENT, local_address) {
+        return;
+    }
+
     for _ in 0..cfg.jc_after_hs {
         let junk = generate_junk(cfg);
-        send_connected(sock, &junk).await;
+        if !send_connected(sock, &junk).await {
+            return;
+        }
         if !cfg.junk_interval.is_zero() {
             tokio::time::sleep(cfg.junk_interval).await;
         }
@@ -328,6 +397,14 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
         return;
     }
 
+    let Ok(local_address) = sock.local_addr() else {
+        return;
+    };
+    if !insert_bounded_once(&KEEPALIVE_ACTIVE, local_address) {
+        log::trace!("aethernoize keepalive junk already active for {local_address}");
+        return;
+    }
+
     let base = cfg.jc_before_hs.max(1);
     let extra = rand::thread_rng().gen_range(0..=base);
     let count = base + extra;
@@ -335,16 +412,37 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
     for _ in 0..count {
         let mut junk = generate_junk(cfg);
         if let Some(first) = junk.first_mut() {
-            if *first >= 1 && *first <= 4 {
+            if (1..=4).contains(first) {
                 *first = first.wrapping_add(0x40);
             }
         }
-        send_connected(sock, &junk).await;
+        if !send_connected(sock, &junk).await {
+            break;
+        }
 
         let jitter = rand::thread_rng().gen_range(0..=8);
         let gap = cfg.junk_interval + Duration::from_millis(jitter);
         if !gap.is_zero() {
             tokio::time::sleep(gap).await;
         }
+    }
+
+    remove_tracked(&KEEPALIVE_ACTIVE, local_address);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_range_is_bounded() {
+        assert_eq!(parse_range("999999"), 2048);
+        assert_eq!(parse_range("0"), 0);
+    }
+
+    #[test]
+    fn cps_output_never_exceeds_per_tag_limit() {
+        let output = parse_cps("<r 4096><rc 4096><rd 4096>");
+        assert_eq!(output.len(), 2048 * 3);
     }
 }

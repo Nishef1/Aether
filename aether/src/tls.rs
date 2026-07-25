@@ -95,7 +95,7 @@ fn masque_idle_timeout_secs(interval: u64, timeout: u64, failures: u64) -> u64 {
     interval
         .saturating_mul(failures)
         .saturating_add(timeout)
-        .clamp(15, 600)
+        .clamp(30, 600)
 }
 
 fn configured_masque_idle_timeout_ms() -> u64 {
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn idle_timeout_combines_interval_timeout_and_failure_budget() {
         assert_eq!(masque_idle_timeout_secs(20, 20, 3), 80);
-        assert_eq!(masque_idle_timeout_secs(5, 1, 1), 15);
+        assert_eq!(masque_idle_timeout_secs(5, 1, 1), 30);
         assert_eq!(masque_idle_timeout_secs(300, 120, 10), 600);
     }
 }

@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 
 use boring::pkey::PKey;
 use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode, SslVersion};
@@ -26,6 +28,15 @@ extern "C" {
 }
 
 const CHROME_GROUPS: &str = "P-256:X25519:P-384";
+const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 20;
+const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_HEALTH_FAILURES: u64 = 3;
+
+static PIN_MODE_LOGGED: OnceLock<()> = OnceLock::new();
+static DISABLED_MODE_LOGGED: OnceLock<()> = OnceLock::new();
+static NO_CERT_LOGGED: OnceLock<()> = OnceLock::new();
+static SPKI_FAILURE_LOGGED: OnceLock<()> = OnceLock::new();
+static REJECTED_SPKI_HASHES: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
 
 pub struct TlsParams<'a> {
     pub cert_pem: &'a [u8],
@@ -48,6 +59,65 @@ fn spki_sha256(cert: &boring::x509::X509Ref) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(hash.as_ref());
     Some(out)
+}
+
+fn log_pin_mismatch_once(hash: [u8; 32]) {
+    let hashes = REJECTED_SPKI_HASHES.get_or_init(|| Mutex::new(HashSet::new()));
+    match hashes.lock() {
+        Ok(mut seen) if seen.insert(hash) => {
+            log::warn!(
+                "tls pin: server cert SPKI hash {:02x?} does not match any pinned hash",
+                hash
+            );
+        }
+        Ok(_) => {
+            log::trace!("tls pin: repeated rejected SPKI hash {:02x?}", hash);
+        }
+        Err(_) => {
+            log::debug!("tls pin: rejected SPKI hash (dedup state unavailable)");
+        }
+    }
+}
+
+fn parse_bounded_u64(value: Option<&str>, default: u64, min: u64, max: u64) -> u64 {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|parsed| parsed.clamp(min, max))
+        .unwrap_or(default.clamp(min, max))
+}
+
+fn env_bounded_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    let value = std::env::var(name).ok();
+    parse_bounded_u64(value.as_deref(), default, min, max)
+}
+
+fn masque_idle_timeout_secs(interval: u64, timeout: u64, failures: u64) -> u64 {
+    interval
+        .saturating_mul(failures)
+        .saturating_add(timeout)
+        .clamp(15, 600)
+}
+
+fn configured_masque_idle_timeout_ms() -> u64 {
+    let interval = env_bounded_u64(
+        "AETHER_MASQUE_HEALTH_INTERVAL_SECS",
+        DEFAULT_HEALTH_INTERVAL_SECS,
+        5,
+        300,
+    );
+    let timeout = env_bounded_u64(
+        "AETHER_MASQUE_HEALTH_TIMEOUT_SECS",
+        DEFAULT_HEALTH_TIMEOUT_SECS,
+        1,
+        120,
+    );
+    let failures = env_bounded_u64(
+        "AETHER_MASQUE_HEALTH_FAILURES",
+        DEFAULT_HEALTH_FAILURES,
+        1,
+        10,
+    );
+    masque_idle_timeout_secs(interval, timeout, failures).saturating_mul(1000)
 }
 
 /// Install TLS verification on an `SslContextBuilder`.
@@ -73,32 +143,41 @@ pub fn install_verification(
             // Pin-only verification: check leaf cert SPKI hash against known pins.
             // No CA chain verification — Cloudflare MASQUE edges use self-signed certs.
             let leaf_cert = ssl.peer_certificate().ok_or_else(|| {
-                log::warn!("tls pin: no peer certificate presented");
+                if NO_CERT_LOGGED.set(()).is_ok() {
+                    log::warn!("tls pin: no peer certificate presented");
+                } else {
+                    log::trace!("tls pin: repeated missing peer certificate");
+                }
                 SslVerifyError::Invalid(boring::ssl::SslAlert::BAD_CERTIFICATE)
             })?;
 
             let hash = spki_sha256(&leaf_cert).ok_or_else(|| {
-                log::warn!("tls pin: failed to compute SPKI hash");
+                if SPKI_FAILURE_LOGGED.set(()).is_ok() {
+                    log::warn!("tls pin: failed to compute SPKI hash");
+                } else {
+                    log::trace!("tls pin: repeated SPKI hash computation failure");
+                }
                 SslVerifyError::Invalid(boring::ssl::SslAlert::INTERNAL_ERROR)
             })?;
 
             let matched = pins.iter().any(|pin| pin.as_slice() == hash.as_slice());
             if !matched {
-                log::warn!(
-                    "tls pin: server cert SPKI hash {:02x?} does not match any pinned hash",
-                    hash
-                );
+                log_pin_mismatch_once(hash);
                 return Err(SslVerifyError::Invalid(
                     boring::ssl::SslAlert::CERTIFICATE_UNKNOWN,
                 ));
             }
-            log::debug!("tls pin: SPKI hash match OK");
+            log::trace!("tls pin: SPKI hash match OK");
             Ok(())
         });
-        log::info!(
-            "tls verification: pin-based ({} pins loaded)",
-            expected_pins.len()
-        );
+        if PIN_MODE_LOGGED.set(()).is_ok() {
+            log::info!(
+                "tls verification: pin-based ({} pins loaded)",
+                expected_pins.len()
+            );
+        } else {
+            log::trace!("tls verification: pin-based context configured");
+        }
     } else {
         // No pin-based verification configured — disable server cert verification.
         // This is required because Aether connects to Cloudflare edge IPs with
@@ -107,7 +186,11 @@ pub fn install_verification(
         // Standard CA validation fails in this context. The security model relies on
         // the encrypted MASQUE tunnel and ECH rather than TLS cert verification.
         builder.set_verify(SslVerifyMode::NONE);
-        log::info!("tls verification: disabled (no pin configured)");
+        if DISABLED_MODE_LOGGED.set(()).is_ok() {
+            log::info!("tls verification: disabled (no pin configured)");
+        } else {
+            log::trace!("tls verification: disabled context configured");
+        }
     }
     Ok(())
 }
@@ -125,7 +208,11 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
 
     builder.set_grease_enabled(true);
     let groups = std::env::var("AETHER_TLS_GROUPS").ok();
-    let groups = groups.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(CHROME_GROUPS);
+    let groups = groups
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(CHROME_GROUPS);
     builder
         .set_curves_list(groups)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -157,7 +244,9 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_application_protos(&[consts::ALPN_H3])
         .map_err(AetherError::Quic)?;
 
-    config.set_max_idle_timeout(120_000);
+    let idle_timeout_ms = configured_masque_idle_timeout_ms();
+    log::debug!("masque QUIC idle timeout: {}ms", idle_timeout_ms);
+    config.set_max_idle_timeout(idle_timeout_ms);
     config.set_max_recv_udp_payload_size(1350);
     config.set_max_send_udp_payload_size(1350);
     config.set_initial_max_data(10_000_000);
@@ -217,4 +306,25 @@ pub fn decode_ech_config_list(b64: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|e| AetherError::Ech(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_parser_clamps_defaults_and_overrides() {
+        assert_eq!(parse_bounded_u64(None, 20, 5, 300), 20);
+        assert_eq!(parse_bounded_u64(Some("invalid"), 20, 5, 300), 20);
+        assert_eq!(parse_bounded_u64(Some("1"), 20, 5, 300), 5);
+        assert_eq!(parse_bounded_u64(Some("999"), 20, 5, 300), 300);
+        assert_eq!(parse_bounded_u64(None, 1, 5, 300), 5);
+    }
+
+    #[test]
+    fn idle_timeout_combines_interval_timeout_and_failure_budget() {
+        assert_eq!(masque_idle_timeout_secs(20, 20, 3), 80);
+        assert_eq!(masque_idle_timeout_secs(5, 1, 1), 15);
+        assert_eq!(masque_idle_timeout_secs(300, 120, 10), 600);
+    }
 }

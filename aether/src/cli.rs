@@ -35,19 +35,27 @@ MASQUE transport:
   --h2, --http2            force HTTP/2 (TCP), skip transport prompt
   --h2-peer <ip:port>      override the peer used for the HTTP/2 transport
   --ech <auto|base64>      enable Encrypted Client Hello
-  --no-data-check          skip the end-to-end data-plane validation
-  --validate-secs <n>      seconds to wait for data-plane validation (1-120, default 10)
+  --no-data-check          skip end-to-end data-plane validation for all transports
+  --validate-secs <n>      seconds to wait for MASQUE data validation (1-120, default 10)
   --health-interval <n>    seconds between MASQUE health probes (5-300)
-  --health-timeout <n>     seconds allowed for a health response (1-120)
-  --health-failures <n>    missed health periods before declaring failure (1-10)
-  --reconnect-secs <n>     base delay before reconnecting after a drop (1-60, default 2)
+  --health-timeout <n>     seconds allowed for a MASQUE health response (1-120)
+  --health-failures <n>    missed MASQUE health periods before failure (1-10)
+  --reconnect-secs <n>     base delay before MASQUE reconnect (1-60, default 2)
   --fragment               fragment the TLS ClientHello on the HTTP/2 transport
-  --fragment-size <n|a-b>  fragment chunk size in bytes (default 16-32)
-  --fragment-delay <n|a-b> delay between fragments in ms (default 2-10)
+  --fragment-size <n|a-b>  fragment size in bytes (1-4096, default 16-32)
+  --fragment-delay <n|a-b> delay between fragments in ms (0-100, default 2-10)
 
 WireGuard:
   --keepalive <n>          persistent keepalive interval in seconds (1-120, default 5)
+  --wg-validate-secs <n>   data-plane validation deadline (1-120, default 10)
+  --wg-health-interval <n> health probe interval (1-60, default 3)
+  --wg-stale-secs <n>      valid-data silence before reconnect (6-300, default 15)
+  --wg-startup-secs <n>    startup window for first valid peer response (10-300, default 30)
+  --wg-reconnect-secs <n>  base delay before WireGuard reconnect (1-60, default 2)
   --no-profile-retry       don't retry other obfuscation profiles during scan
+
+Netstack:
+  --udp-idle-secs <n>      idle UDP association lifetime (30-3600, default 300)
 
 Config files:
   --config <path>          base identity config path (default aether.toml)
@@ -88,26 +96,27 @@ impl MasqueTransportChoice {
 
 pub fn parse_and_apply() -> crate::error::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut i = 0;
+    let mut index = 0;
 
-    while i < args.len() {
-        let arg = args[i].as_str();
+    while index < args.len() {
+        let argument = args[index].as_str();
 
         macro_rules! next_value {
             () => {{
-                i += 1;
-                args.get(i).ok_or_else(|| {
-                    crate::error::AetherError::Other(format!("{arg} requires a value"))
+                index += 1;
+                args.get(index).ok_or_else(|| {
+                    crate::error::AetherError::Other(format!(
+                        "{argument} requires a value"
+                    ))
                 })?
             }};
         }
 
-        match arg {
+        match argument {
             "-v" | "--version" => {
                 println!("aether {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
-
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -151,48 +160,95 @@ pub fn parse_and_apply() -> crate::error::Result<()> {
             "--validate-secs" => set_bounded_u64(
                 "AETHER_MASQUE_VALIDATE_SECS",
                 next_value!(),
-                arg,
+                argument,
                 1,
                 120,
             )?,
             "--health-interval" => {
-                let value = bounded_u64(next_value!(), arg, 5, 300)?;
-                let value = value.to_string();
+                let value = bounded_u64(next_value!(), argument, 5, 300)?.to_string();
                 set("AETHER_MASQUE_HEALTH_INTERVAL_SECS", &value);
                 set("AETHER_MASQUE_H2_KEEPALIVE_SECS", &value);
             }
             "--health-timeout" => {
-                let value = bounded_u64(next_value!(), arg, 1, 120)?;
-                let value = value.to_string();
+                let value = bounded_u64(next_value!(), argument, 1, 120)?.to_string();
                 set("AETHER_MASQUE_HEALTH_TIMEOUT_SECS", &value);
                 set("AETHER_MASQUE_H2_KEEPALIVE_TIMEOUT_SECS", &value);
             }
             "--health-failures" => set_bounded_u64(
                 "AETHER_MASQUE_HEALTH_FAILURES",
                 next_value!(),
-                arg,
+                argument,
                 1,
                 10,
             )?,
             "--reconnect-secs" => set_bounded_u64(
                 "AETHER_MASQUE_RECONNECT_SECS",
                 next_value!(),
-                arg,
+                argument,
                 1,
                 60,
             )?,
             "--fragment" => set("AETHER_MASQUE_H2_FRAGMENT", "1"),
-            "--fragment-size" => set("AETHER_MASQUE_H2_FRAGMENT_SIZE", next_value!()),
-            "--fragment-delay" => set("AETHER_MASQUE_H2_FRAGMENT_DELAY", next_value!()),
+            "--fragment-size" => {
+                let value = bounded_range(next_value!(), argument, 1, 4096)?;
+                set("AETHER_MASQUE_H2_FRAGMENT_SIZE", &value);
+            }
+            "--fragment-delay" => {
+                let value = bounded_range(next_value!(), argument, 0, 100)?;
+                set("AETHER_MASQUE_H2_FRAGMENT_DELAY", &value);
+            }
 
             "--keepalive" => set_bounded_u64(
                 "AETHER_WG_KEEPALIVE",
                 next_value!(),
-                arg,
+                argument,
                 1,
                 120,
             )?,
+            "--wg-validate-secs" => set_bounded_u64(
+                "AETHER_WG_VALIDATE_SECS",
+                next_value!(),
+                argument,
+                1,
+                120,
+            )?,
+            "--wg-health-interval" => set_bounded_u64(
+                "AETHER_WG_HEALTH_INTERVAL_SECS",
+                next_value!(),
+                argument,
+                1,
+                60,
+            )?,
+            "--wg-stale-secs" => set_bounded_u64(
+                "AETHER_WG_STALE_SECS",
+                next_value!(),
+                argument,
+                6,
+                300,
+            )?,
+            "--wg-startup-secs" => set_bounded_u64(
+                "AETHER_WG_STARTUP_SECS",
+                next_value!(),
+                argument,
+                10,
+                300,
+            )?,
+            "--wg-reconnect-secs" => set_bounded_u64(
+                "AETHER_WG_RECONNECT_SECS",
+                next_value!(),
+                argument,
+                1,
+                60,
+            )?,
             "--no-profile-retry" => set("AETHER_WG_NO_PROFILE_RETRY", "1"),
+
+            "--udp-idle-secs" => set_bounded_u64(
+                "AETHER_NETSTACK_UDP_IDLE_SECS",
+                next_value!(),
+                argument,
+                30,
+                3600,
+            )?,
 
             "--config" => set("AETHER_CONFIG", next_value!()),
             "--wg-config" => set("AETHER_WG_CONFIG", next_value!()),
@@ -210,7 +266,7 @@ pub fn parse_and_apply() -> crate::error::Result<()> {
             }
         }
 
-        i += 1;
+        index += 1;
     }
 
     Ok(())
@@ -235,30 +291,58 @@ fn apply_masque_transport(value: &str) -> crate::error::Result<()> {
 fn bounded_u64(
     value: &str,
     option: &str,
-    min: u64,
-    max: u64,
+    minimum: u64,
+    maximum: u64,
 ) -> crate::error::Result<u64> {
     let parsed = value.parse::<u64>().map_err(|_| {
         crate::error::AetherError::Other(format!(
-            "{option} expects an integer between {min} and {max}; got '{value}'"
+            "{option} expects an integer between {minimum} and {maximum}; got '{value}'"
         ))
     })?;
-    if !(min..=max).contains(&parsed) {
+    if !(minimum..=maximum).contains(&parsed) {
         return Err(crate::error::AetherError::Other(format!(
-            "{option} expects a value between {min} and {max}; got {parsed}"
+            "{option} expects a value between {minimum} and {maximum}; got {parsed}"
         )));
     }
     Ok(parsed)
+}
+
+fn bounded_range(
+    value: &str,
+    option: &str,
+    minimum: u64,
+    maximum: u64,
+) -> crate::error::Result<String> {
+    let (left, right) = match value.split_once('-') {
+        Some((left, right)) => (
+            bounded_u64(left.trim(), option, minimum, maximum)?,
+            bounded_u64(right.trim(), option, minimum, maximum)?,
+        ),
+        None => {
+            let value = bounded_u64(value.trim(), option, minimum, maximum)?;
+            (value, value)
+        }
+    };
+    let (low, high) = if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if low == high {
+        Ok(low.to_string())
+    } else {
+        Ok(format!("{low}-{high}"))
+    }
 }
 
 fn set_bounded_u64(
     key: &str,
     value: &str,
     option: &str,
-    min: u64,
-    max: u64,
+    minimum: u64,
+    maximum: u64,
 ) -> crate::error::Result<()> {
-    let value = bounded_u64(value, option, min, max)?.to_string();
+    let value = bounded_u64(value, option, minimum, maximum)?.to_string();
     set(key, &value);
     Ok(())
 }
@@ -298,5 +382,12 @@ mod tests {
         assert!(bounded_u64("0", "--health-interval", 5, 300).is_err());
         assert!(bounded_u64("301", "--health-interval", 5, 300).is_err());
         assert!(bounded_u64("not-a-number", "--health-interval", 5, 300).is_err());
+    }
+
+    #[test]
+    fn fragment_ranges_are_validated_and_normalized() {
+        assert_eq!(bounded_range("32-16", "--fragment-size", 1, 4096).unwrap(), "16-32");
+        assert!(bounded_range("0-16", "--fragment-size", 1, 4096).is_err());
+        assert!(bounded_range("1-101", "--fragment-delay", 0, 100).is_err());
     }
 }

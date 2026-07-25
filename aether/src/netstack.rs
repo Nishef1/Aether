@@ -1,11 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Instant as StdInstant;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
-use smoltcp::time::{Duration as SmolDuration, Instant};
+use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use tokio::sync::{mpsc, oneshot};
 
@@ -31,24 +31,11 @@ fn app_queue() -> usize {
     crate::sysprofile::channel_capacity()
 }
 
-fn max_tcp_pending() -> usize {
-    tcp_buf().saturating_mul(4).max(64 * 1024)
-}
-
-fn udp_idle_timeout() -> std::time::Duration {
-    let seconds = std::env::var("AETHER_NETSTACK_UDP_IDLE_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|value| value.clamp(30, 3600))
-        .unwrap_or(300);
-    std::time::Duration::from_secs(seconds)
-}
-
 const MAX_INGEST_PER_TICK: usize = 512;
 const MAX_RECV_CHUNKS: usize = 128;
-const TCP_SOCKET_TIMEOUT_SECS: u64 = 30;
-const MIN_TUNNEL_MTU: usize = 576;
-const MAX_TUNNEL_MTU: usize = 65_535;
+
+type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
+type OpenUdpResp = oneshot::Sender<std::result::Result<UdpConn, String>>;
 
 pub struct StackDevice {
     rx: VecDeque<Vec<u8>>,
@@ -67,32 +54,20 @@ impl StackDevice {
 }
 
 pub struct StackRxToken(Vec<u8>);
-
-pub struct StackTxToken<'a> {
-    queue: &'a mut VecDeque<Vec<u8>>,
-    mtu: usize,
-}
+pub struct StackTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
 
 impl RxToken for StackRxToken {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, function: F) -> R {
-        function(&self.0)
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(&self.0)
     }
 }
 
 impl<'a> TxToken for StackTxToken<'a> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, function: F) -> R {
-        let mut buffer = vec![0u8; len];
-        let result = function(&mut buffer);
-        if len <= self.mtu && self.queue.len() < app_queue() {
-            self.queue.push_back(buffer);
-        } else {
-            log::debug!(
-                "netstack dropped generated packet: len={len} mtu={} tx_queue={}",
-                self.mtu,
-                self.queue.len()
-            );
-        }
-        result
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        let mut buf = vec![0u8; len];
+        let r = f(&mut buf);
+        self.0.push_back(buf);
+        r
     }
 }
 
@@ -100,37 +75,25 @@ impl Device for StackDevice {
     type RxToken<'a> = StackRxToken;
     type TxToken<'a> = StackTxToken<'a>;
 
-    fn receive(&mut self, _time: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let packet = self.rx.pop_front()?;
-        Some((
-            StackRxToken(packet),
-            StackTxToken {
-                queue: &mut self.tx,
-                mtu: self.mtu,
-            },
-        ))
+    fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let pkt = self.rx.pop_front()?;
+        Some((StackRxToken(pkt), StackTxToken(&mut self.tx)))
     }
 
-    fn transmit(&mut self, _time: Instant) -> Option<Self::TxToken<'_>> {
-        Some(StackTxToken {
-            queue: &mut self.tx,
-            mtu: self.mtu,
-        })
+    fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
+        Some(StackTxToken(&mut self.tx))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = self.mtu;
-        capabilities.checksum.ipv4 = Checksum::Tx;
-        capabilities.checksum.tcp = Checksum::Tx;
-        capabilities.checksum.udp = Checksum::Tx;
-        capabilities
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ip;
+        caps.max_transmission_unit = self.mtu;
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps
     }
 }
-
-type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
-type OpenUdpResp = oneshot::Sender<std::result::Result<UdpConn, String>>;
 
 pub enum Cmd {
     OpenTcp { dst: SocketAddr, resp: OpenTcpResp },
@@ -249,27 +212,24 @@ pub struct StackHandle {
 
 impl StackHandle {
     pub async fn open_tcp(&self, dst: SocketAddr) -> Result<TcpConn> {
-        let (response_tx, response_rx) = oneshot::channel();
+        let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Cmd::OpenTcp {
-                dst,
-                resp: response_tx,
-            })
+            .send(Cmd::OpenTcp { dst, resp: resp_tx })
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))?;
-        response_rx
+        resp_rx
             .await
             .map_err(|_| AetherError::Other("netstack dropped".into()))?
             .map_err(AetherError::Other)
     }
 
     pub async fn open_udp(&self) -> Result<UdpConn> {
-        let (response_tx, response_rx) = oneshot::channel();
+        let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Cmd::OpenUdp { resp: response_tx })
+            .send(Cmd::OpenUdp { resp: resp_tx })
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))?;
-        response_rx
+        resp_rx
             .await
             .map_err(|_| AetherError::Other("netstack dropped".into()))?
             .map_err(AetherError::Other)
@@ -280,7 +240,6 @@ impl StackHandle {
         v4: Option<(Ipv4Addr, u8)>,
         v6: Option<(Ipv6Addr, u8)>,
     ) -> Result<()> {
-        validate_prefixes(v4, v6)?;
         self.cmd_tx
             .send(Cmd::SetAddrs { v4, v6 })
             .await
@@ -301,7 +260,6 @@ struct TcpState {
 struct UdpState {
     handle: SocketHandle,
     to_app: mpsc::Sender<(SocketAddr, Vec<u8>)>,
-    last_activity: StdInstant,
 }
 
 pub struct NetStack {
@@ -315,84 +273,61 @@ pub struct NetStack {
     data_in_tx: mpsc::Sender<DataIn>,
 }
 
-fn strip_cidr(value: &str) -> &str {
-    match value.split_once('/') {
+fn strip_cidr(s: &str) -> &str {
+    match s.split_once('/') {
         Some((ip, _)) => ip,
-        None => value,
+        None => s,
     }
 }
 
 fn to_ip_address(ip: IpAddr) -> IpAddress {
     match ip {
-        IpAddr::V4(address) => IpAddress::Ipv4(Ipv4Address::from(address)),
-        IpAddr::V6(address) => IpAddress::Ipv6(Ipv6Address::from(address)),
+        IpAddr::V4(v4) => IpAddress::Ipv4(Ipv4Address::from(v4)),
+        IpAddr::V6(v6) => IpAddress::Ipv6(Ipv6Address::from(v6)),
     }
 }
 
-fn to_ip_endpoint(address: SocketAddr) -> IpEndpoint {
-    IpEndpoint::new(to_ip_address(address.ip()), address.port())
+fn to_ip_endpoint(addr: SocketAddr) -> IpEndpoint {
+    IpEndpoint::new(to_ip_address(addr.ip()), addr.port())
 }
 
-fn cidr_prefix(value: &str) -> Option<u8> {
-    value
-        .split_once('/')
-        .and_then(|(_, prefix)| prefix.parse().ok())
+fn cidr_prefix(s: &str) -> Option<u8> {
+    s.split_once('/').and_then(|(_, p)| p.parse().ok())
 }
 
-fn parse_v4(value: &str) -> Result<Option<(Ipv4Addr, u8)>> {
-    if value.is_empty() {
+fn parse_v4(s: &str) -> Result<Option<(Ipv4Addr, u8)>> {
+    if s.is_empty() {
         return Ok(None);
     }
-    let ip: Ipv4Addr = strip_cidr(value)
+    let ip: Ipv4Addr = strip_cidr(s)
         .parse()
-        .map_err(|_| AetherError::Other(format!("bad ipv4 {value}")))?;
-    let prefix = cidr_prefix(value).unwrap_or(32);
-    if prefix > 32 {
-        return Err(AetherError::Other(format!("bad ipv4 prefix {value}")));
-    }
-    Ok(Some((ip, prefix)))
+        .map_err(|_| AetherError::Other(format!("bad ipv4 {s}")))?;
+    Ok(Some((ip, cidr_prefix(s).unwrap_or(32))))
 }
 
-fn parse_v6(value: &str) -> Result<Option<(Ipv6Addr, u8)>> {
-    if value.is_empty() {
+fn parse_v6(s: &str) -> Result<Option<(Ipv6Addr, u8)>> {
+    if s.is_empty() {
         return Ok(None);
     }
-    let ip: Ipv6Addr = strip_cidr(value)
+    let ip: Ipv6Addr = strip_cidr(s)
         .parse()
-        .map_err(|_| AetherError::Other(format!("bad ipv6 {value}")))?;
-    let prefix = cidr_prefix(value).unwrap_or(128);
-    if prefix > 128 {
-        return Err(AetherError::Other(format!("bad ipv6 prefix {value}")));
-    }
-    Ok(Some((ip, prefix)))
+        .map_err(|_| AetherError::Other(format!("bad ipv6 {s}")))?;
+    Ok(Some((ip, cidr_prefix(s).unwrap_or(128))))
 }
 
-fn validate_prefixes(
-    v4: Option<(Ipv4Addr, u8)>,
-    v6: Option<(Ipv6Addr, u8)>,
-) -> Result<()> {
-    if v4.is_some_and(|(_, prefix)| prefix > 32) {
-        return Err(AetherError::Other("invalid IPv4 prefix".into()));
-    }
-    if v6.is_some_and(|(_, prefix)| prefix > 128) {
-        return Err(AetherError::Other("invalid IPv6 prefix".into()));
-    }
-    Ok(())
-}
-
-fn routable_prefix_v4(prefix: u8) -> u8 {
-    if prefix >= 31 {
+fn routable_prefix_v4(p: u8) -> u8 {
+    if p >= 31 {
         24
     } else {
-        prefix
+        p
     }
 }
 
-fn routable_prefix_v6(prefix: u8) -> u8 {
-    if prefix >= 127 {
+fn routable_prefix_v6(p: u8) -> u8 {
+    if p >= 127 {
         64
     } else {
-        prefix
+        p
     }
 }
 
@@ -401,62 +336,43 @@ fn apply_addrs(
     v4: Option<(Ipv4Addr, u8)>,
     v6: Option<(Ipv6Addr, u8)>,
 ) {
-    iface.update_ip_addrs(|addresses| {
-        addresses.clear();
-        if let Some((ip, prefix)) = v4 {
-            if addresses
-                .push(IpCidr::new(
-                    IpAddress::Ipv4(Ipv4Address::from(ip)),
-                    routable_prefix_v4(prefix),
-                ))
-                .is_err()
-            {
-                log::warn!("netstack IPv4 address table is full");
-            }
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        if let Some((ip, p)) = v4 {
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::from(ip)),
+                routable_prefix_v4(p),
+            ));
         }
-        if let Some((ip, prefix)) = v6 {
-            if addresses
-                .push(IpCidr::new(
-                    IpAddress::Ipv6(Ipv6Address::from(ip)),
-                    routable_prefix_v6(prefix),
-                ))
-                .is_err()
-            {
-                log::warn!("netstack IPv6 address table is full");
-            }
+        if let Some((ip, p)) = v6 {
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::Ipv6(Ipv6Address::from(ip)),
+                routable_prefix_v6(p),
+            ));
         }
     });
 
-    let routes = iface.routes_mut();
-    routes.remove_default_ipv4_route();
-    routes.remove_default_ipv6_route();
-
     if let Some((ip, _)) = v4 {
-        let octets = ip.octets();
-        let host = if octets[3] == 1 { 2 } else { 1 };
-        let gateway = Ipv4Address::new(octets[0], octets[1], octets[2], host);
-        if routes.add_default_ipv4_route(gateway).is_err() {
-            log::warn!("netstack IPv4 route table is full");
-        }
+        let o = ip.octets();
+        let host = if o[3] == 1 { 2 } else { 1 };
+        let gw = Ipv4Address::new(o[0], o[1], o[2], host);
+        let _ = iface.routes_mut().add_default_ipv4_route(gw);
     }
     if let Some((ip, _)) = v6 {
-        let mut octets = ip.octets();
-        octets[15] = if octets[15] == 1 { 2 } else { 1 };
-        if routes
-            .add_default_ipv6_route(Ipv6Address::from(octets))
-            .is_err()
-        {
-            log::warn!("netstack IPv6 route table is full");
-        }
+        let mut o = ip.octets();
+        o[15] = if o[15] == 1 { 2 } else { 1 };
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Address::from(o));
     }
 }
 
-fn endpoint_to_socketaddr(endpoint: IpEndpoint) -> SocketAddr {
-    let ip = match endpoint.addr {
-        IpAddress::Ipv4(address) => IpAddr::V4(address.into()),
-        IpAddress::Ipv6(address) => IpAddr::V6(address.into()),
+fn endpoint_to_socketaddr(ep: IpEndpoint) -> SocketAddr {
+    let ip = match ep.addr {
+        IpAddress::Ipv4(v4) => IpAddr::V4(v4.into()),
+        IpAddress::Ipv6(v6) => IpAddr::V6(v6.into()),
     };
-    SocketAddr::new(ip, endpoint.port)
+    SocketAddr::new(ip, ep.port)
 }
 
 pub fn spawn(
@@ -466,19 +382,13 @@ pub fn spawn(
     inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<StackHandle> {
-    if !(MIN_TUNNEL_MTU..=MAX_TUNNEL_MTU).contains(&mtu) {
-        return Err(AetherError::Other(format!(
-            "invalid netstack MTU {mtu}; expected {MIN_TUNNEL_MTU}..={MAX_TUNNEL_MTU}"
-        )));
-    }
-
     let mut device = StackDevice::new(mtu);
+
     let config = Config::new(HardwareAddress::Ip);
     let mut iface = Interface::new(config, &mut device, Instant::now());
 
     let v4 = parse_v4(ipv4)?;
     let v6 = parse_v6(ipv6)?;
-    validate_prefixes(v4, v6)?;
     apply_addrs(&mut iface, v4, v6);
 
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -495,27 +405,19 @@ pub fn spawn(
         data_in_tx: data_in_tx.clone(),
     };
 
-    tokio::spawn(async move {
-        if let Err(error) = run(stack, cmd_rx, data_in_rx, inbound_rx, outbound_tx).await {
-            log::warn!("netstack stopped: {error}");
-        }
-    });
+    tokio::spawn(run(stack, cmd_rx, data_in_rx, inbound_rx, outbound_tx));
 
     Ok(StackHandle { cmd_tx })
 }
 
-fn alloc_port(port: &mut u16) -> u16 {
-    let allocated = *port;
-    *port = if allocated >= 65000 {
-        49152
-    } else {
-        allocated + 1
-    };
-    allocated
+fn alloc_port(p: &mut u16) -> u16 {
+    let port = *p;
+    *p = if port >= 65000 { 49152 } else { port + 1 };
+    port
 }
 
 async fn run(
-    mut stack: NetStack,
+    mut s: NetStack,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     mut data_in_rx: mpsc::Receiver<DataIn>,
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
@@ -524,75 +426,52 @@ async fn run(
     loop {
         let now = Instant::now();
         let poll_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            stack
-                .iface
-                .poll(now, &mut stack.device, &mut stack.sockets);
+            s.iface.poll(now, &mut s.device, &mut s.sockets);
         }));
         if poll_outcome.is_err() {
-            return Err(AetherError::Other(
-                "smoltcp panicked while polling; refusing to continue with corrupted state".into(),
-            ));
+            s.device.rx.clear();
+            s.device.tx.clear();
         }
-        service_tcp(&mut stack).await;
-        service_udp(&mut stack).await;
-        flush_tx(&mut stack, &outbound_tx).await?;
+        service_tcp(&mut s).await;
+        service_udp(&mut s).await;
+        flush_tx(&mut s, &outbound_tx).await;
 
-        let delay = stack
+        let delay = s
             .iface
-            .poll_delay(Instant::now(), &stack.sockets)
-            .map(|duration| std::time::Duration::from_micros(duration.total_micros()));
+            .poll_delay(Instant::now(), &s.sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()));
 
         tokio::select! {
             biased;
 
             maybe = inbound_rx.recv() => {
                 match maybe {
-                    Some(packet) => {
-                        if packet.len() <= MAX_TUNNEL_MTU {
-                            stack.device.rx.push_back(packet);
-                        } else {
-                            log::debug!("netstack dropped oversized inbound packet");
-                        }
-                        let mut count = 0;
-                        while count < MAX_INGEST_PER_TICK {
+                    Some(pkt) => {
+                        s.device.rx.push_back(pkt);
+                        let mut n = 0;
+                        while n < MAX_INGEST_PER_TICK {
                             match inbound_rx.try_recv() {
-                                Ok(packet) => {
-                                    if packet.len() <= MAX_TUNNEL_MTU {
-                                        stack.device.rx.push_back(packet);
-                                    }
-                                    count += 1;
-                                }
+                                Ok(p) => { s.device.rx.push_back(p); n += 1; }
                                 Err(_) => break,
                             }
                         }
                     }
-                    None => {
-                        return Err(AetherError::Other(
-                            "tunnel input channel closed".into(),
-                        ));
-                    }
+                    None => return Ok(()),
                 }
             }
 
             maybe = cmd_rx.recv() => {
                 match maybe {
-                    Some(command) => handle_cmd(&mut stack, command),
+                    Some(cmd) => handle_cmd(&mut s, cmd),
                     None => return Ok(()),
                 }
             }
 
             maybe = data_in_rx.recv() => {
-                match maybe {
-                    Some(data) => {
-                        handle_data(&mut stack, data);
-                        while let Ok(more) = data_in_rx.try_recv() {
-                            handle_data(&mut stack, more);
-                        }
-                    }
-                    None => {
-                        return Err(AetherError::Other(
-                            "netstack application input channel closed".into(),
-                        ));
+                if let Some(d) = maybe {
+                    handle_data(&mut s, d);
+                    while let Ok(d2) = data_in_rx.try_recv() {
+                        handle_data(&mut s, d2);
                     }
                 }
             }
@@ -604,35 +483,34 @@ async fn run(
 
 async fn sleep_opt(delay: Option<std::time::Duration>) {
     match delay {
-        Some(duration) => tokio::time::sleep(duration).await,
+        Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending::<()>().await,
     }
 }
 
-fn handle_cmd(stack: &mut NetStack, command: Cmd) {
-    match command {
+fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
+    match cmd {
         Cmd::OpenTcp { dst, resp } => {
-            let receive_buffer = tcp::SocketBuffer::new(vec![0u8; tcp_buf()]);
-            let transmit_buffer = tcp::SocketBuffer::new(vec![0u8; tcp_buf()]);
-            let mut socket = tcp::Socket::new(receive_buffer, transmit_buffer);
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_buf()]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_buf()]);
+            let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             socket.set_nagle_enabled(false);
-            socket.set_timeout(Some(SmolDuration::from_secs(TCP_SOCKET_TIMEOUT_SECS)));
 
-            let local_port = alloc_port(&mut stack.next_port);
+            let local_port = alloc_port(&mut s.next_port);
             let remote = to_ip_endpoint(dst);
 
-            if let Err(error) = socket.connect(stack.iface.context(), remote, local_port) {
-                let _ = resp.send(Err(format!("connect: {error:?}")));
+            if let Err(e) = socket.connect(s.iface.context(), remote, local_port) {
+                let _ = resp.send(Err(format!("connect: {e:?}")));
                 return;
             }
 
-            let handle = stack.sockets.add(socket);
-            let id = stack.next_id;
-            stack.next_id = stack.next_id.wrapping_add(1).max(1);
+            let handle = s.sockets.add(socket);
+            let id = s.next_id;
+            s.next_id += 1;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(app_queue());
 
-            stack.tcp_conns.insert(
+            s.tcp_conns.insert(
                 id,
                 TcpState {
                     handle,
@@ -646,283 +524,197 @@ fn handle_cmd(stack: &mut NetStack, command: Cmd) {
             );
         }
         Cmd::OpenUdp { resp } => {
-            let receive_metadata = vec![udp::PacketMetadata::EMPTY; udp_meta()];
-            let transmit_metadata = vec![udp::PacketMetadata::EMPTY; udp_meta()];
-            let receive_buffer = udp::PacketBuffer::new(receive_metadata, vec![0u8; udp_buf()]);
-            let transmit_buffer = udp::PacketBuffer::new(transmit_metadata, vec![0u8; udp_buf()]);
-            let mut socket = udp::Socket::new(receive_buffer, transmit_buffer);
+            let rx_meta = vec![udp::PacketMetadata::EMPTY; udp_meta()];
+            let tx_meta = vec![udp::PacketMetadata::EMPTY; udp_meta()];
+            let rx_buf = udp::PacketBuffer::new(rx_meta, vec![0u8; udp_buf()]);
+            let tx_buf = udp::PacketBuffer::new(tx_meta, vec![0u8; udp_buf()]);
+            let mut socket = udp::Socket::new(rx_buf, tx_buf);
 
-            let local_port = alloc_port(&mut stack.next_port);
-            if let Err(error) = socket.bind(local_port) {
-                let _ = resp.send(Err(format!("bind: {error:?}")));
+            let local_port = alloc_port(&mut s.next_port);
+            if let Err(e) = socket.bind(local_port) {
+                let _ = resp.send(Err(format!("bind: {e:?}")));
                 return;
             }
 
-            let handle = stack.sockets.add(socket);
-            let id = stack.next_id;
-            stack.next_id = stack.next_id.wrapping_add(1).max(1);
+            let handle = s.sockets.add(socket);
+            let id = s.next_id;
+            s.next_id += 1;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(app_queue());
-            stack.udp_conns.insert(
-                id,
-                UdpState {
-                    handle,
-                    to_app: to_app_tx,
-                    last_activity: StdInstant::now(),
-                },
-            );
+            s.udp_conns.insert(id, UdpState { handle, to_app: to_app_tx });
 
-            let connection = UdpConn {
+            let conn = UdpConn {
                 id,
                 from_stack: to_app_rx,
-                data_in: stack.data_in_tx.clone(),
+                data_in: s.data_in_tx.clone(),
             };
-            let _ = resp.send(Ok(connection));
+            let _ = resp.send(Ok(conn));
         }
         Cmd::SetAddrs { v4, v6 } => {
-            if let Err(error) = validate_prefixes(v4, v6) {
-                log::warn!("ignored invalid edge address assignment: {error}");
-                return;
-            }
-            apply_addrs(&mut stack.iface, v4, v6);
+            apply_addrs(&mut s.iface, v4, v6);
             log::info!("netstack addresses synchronized from edge capsule");
         }
     }
 }
 
-fn handle_data(stack: &mut NetStack, data: DataIn) {
-    match data {
+fn handle_data(s: &mut NetStack, d: DataIn) {
+    match d {
         DataIn::Tcp(id, data) => {
-            let mut abort = None;
-            if let Some(state) = stack.tcp_conns.get_mut(&id) {
-                if state.pending.len().saturating_add(data.len()) > max_tcp_pending() {
-                    log::warn!(
-                        "netstack TCP pending queue exceeded {} bytes; aborting connection {id}",
-                        max_tcp_pending()
-                    );
-                    state.pending.clear();
-                    state.half_closed = true;
-                    abort = Some(state.handle);
-                } else {
-                    state.pending.extend_from_slice(&data);
-                }
-            }
-            if let Some(handle) = abort {
-                stack.sockets.get_mut::<tcp::Socket>(handle).abort();
+            if let Some(st) = s.tcp_conns.get_mut(&id) {
+                st.pending.extend_from_slice(&data);
             }
         }
         DataIn::TcpClose(id) => {
-            if let Some(state) = stack.tcp_conns.get_mut(&id) {
-                state.half_closed = true;
+            if let Some(st) = s.tcp_conns.get_mut(&id) {
+                st.half_closed = true;
             }
         }
-        DataIn::Udp(id, destination, data) => {
-            if let Some(state) = stack.udp_conns.get_mut(&id) {
-                state.last_activity = StdInstant::now();
-                let socket = stack.sockets.get_mut::<udp::Socket>(state.handle);
-                if let Err(error) = socket.send_slice(&data, to_ip_endpoint(destination)) {
-                    log::debug!("netstack UDP send dropped for {destination}: {error}");
-                }
+        DataIn::Udp(id, dst, data) => {
+            if let Some(st) = s.udp_conns.get(&id) {
+                let sock = s.sockets.get_mut::<udp::Socket>(st.handle);
+                let _ = sock.send_slice(&data, to_ip_endpoint(dst));
             }
         }
         DataIn::UdpClose(id) => {
-            if let Some(state) = stack.udp_conns.remove(&id) {
-                stack.sockets.remove(state.handle);
+            if let Some(st) = s.udp_conns.remove(&id) {
+                s.sockets.remove(st.handle);
             }
         }
     }
 }
 
-async fn service_tcp(stack: &mut NetStack) {
-    let ids: Vec<usize> = stack.tcp_conns.keys().copied().collect();
+async fn service_tcp(s: &mut NetStack) {
+    let ids: Vec<usize> = s.tcp_conns.keys().copied().collect();
 
     for id in ids {
-        let handle = match stack.tcp_conns.get(&id) {
-            Some(state) => state.handle,
+        let handle = match s.tcp_conns.get(&id) {
+            Some(st) => st.handle,
             None => continue,
         };
 
-        let socket_state = stack.sockets.get_mut::<tcp::Socket>(handle).state();
-        let data_in_tx = stack.data_in_tx.clone();
+        let state = s.sockets.get_mut::<tcp::Socket>(handle).state();
+        let data_in_tx = s.data_in_tx.clone();
 
-        if !stack.tcp_conns[&id].established && socket_state == tcp::State::Established {
-            if let Some(state) = stack.tcp_conns.get_mut(&id) {
-                state.established = true;
-                if let (Some(response), Some(receiver)) =
-                    (state.connect_resp.take(), state.from_stack_rx.take())
-                {
-                    let connection = TcpConn {
+        if !s.tcp_conns[&id].established && state == tcp::State::Established {
+            if let Some(st) = s.tcp_conns.get_mut(&id) {
+                st.established = true;
+                if let (Some(resp), Some(rx)) = (st.connect_resp.take(), st.from_stack_rx.take()) {
+                    let conn = TcpConn {
                         id,
-                        from_stack: receiver,
+                        from_stack: rx,
                         data_in: data_in_tx.clone(),
                     };
-                    let _ = response.send(Ok(connection));
+                    let _ = resp.send(Ok(conn));
                 }
             }
         }
 
-        if !stack.tcp_conns[&id].established
-            && matches!(socket_state, tcp::State::Closed | tcp::State::TimeWait)
+        if !s.tcp_conns[&id].established
+            && matches!(state, tcp::State::Closed | tcp::State::TimeWait)
         {
-            if let Some(state) = stack.tcp_conns.get_mut(&id) {
-                if let Some(response) = state.connect_resp.take() {
-                    let _ = response.send(Err("connection refused or timed out".into()));
+            if let Some(st) = s.tcp_conns.get_mut(&id) {
+                if let Some(resp) = st.connect_resp.take() {
+                    let _ = resp.send(Err("connection refused".into()));
                 }
             }
-            stack.sockets.remove(handle);
-            stack.tcp_conns.remove(&id);
+            s.sockets.remove(handle);
+            s.tcp_conns.remove(&id);
             continue;
         }
 
         {
-            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let socket = s.sockets.get_mut::<tcp::Socket>(handle);
             if socket.can_send() {
-                let state = stack.tcp_conns.get_mut(&id).unwrap();
-                if !state.pending.is_empty() {
-                    match socket.send_slice(&state.pending) {
-                        Ok(sent) if sent > 0 => {
-                            state.pending.drain(0..sent);
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            log::debug!("netstack TCP send failed for connection {id}: {error}");
-                            socket.abort();
-                        }
+                let st = s.tcp_conns.get_mut(&id).unwrap();
+                if !st.pending.is_empty() {
+                    let sent = socket.send_slice(&st.pending).unwrap_or(0);
+                    if sent > 0 {
+                        st.pending.drain(0..sent);
                     }
                 }
             }
         }
 
         {
-            let pending_empty = stack.tcp_conns[&id].pending.is_empty();
-            let half_closed = stack.tcp_conns[&id].half_closed;
-            if half_closed && pending_empty {
-                stack.sockets.get_mut::<tcp::Socket>(handle).close();
+            let pending_empty = s.tcp_conns[&id].pending.is_empty();
+            let half = s.tcp_conns[&id].half_closed;
+            if half && pending_empty {
+                s.sockets.get_mut::<tcp::Socket>(handle).close();
             }
         }
 
-        let mut chunks = Vec::new();
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
         {
-            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            let socket = s.sockets.get_mut::<tcp::Socket>(handle);
             while socket.can_recv() && chunks.len() < MAX_RECV_CHUNKS {
-                match socket.recv(|buffer| {
-                    let data = buffer.to_vec();
-                    (data.len(), data)
+                match socket.recv(|buf| {
+                    let v = buf.to_vec();
+                    (v.len(), v)
                 }) {
-                    Ok(data) if !data.is_empty() => chunks.push(data),
+                    Ok(v) if !v.is_empty() => chunks.push(v),
                     _ => break,
                 }
             }
         }
 
-        let to_app = stack.tcp_conns[&id].to_app.clone();
+        let to_app = s.tcp_conns[&id].to_app.clone();
         let mut app_gone = false;
-        for chunk in chunks {
-            if to_app.send(chunk).await.is_err() {
+        for v in chunks {
+            if to_app.send(v).await.is_err() {
                 app_gone = true;
                 break;
             }
         }
         if app_gone {
-            stack.sockets.get_mut::<tcp::Socket>(handle).abort();
+            s.sockets.get_mut::<tcp::Socket>(handle).close();
         }
 
-        let final_state = stack.sockets.get_mut::<tcp::Socket>(handle).state();
-        if matches!(final_state, tcp::State::CloseWait) {
-            stack.sockets.get_mut::<tcp::Socket>(handle).close();
+        let st_state = s.sockets.get_mut::<tcp::Socket>(handle).state();
+        if matches!(st_state, tcp::State::CloseWait) {
+            s.sockets.get_mut::<tcp::Socket>(handle).close();
         }
-        if matches!(final_state, tcp::State::Closed)
-            && stack.tcp_conns[&id].established
-        {
-            stack.sockets.remove(handle);
-            stack.tcp_conns.remove(&id);
+        if matches!(st_state, tcp::State::Closed) && s.tcp_conns[&id].established {
+            s.sockets.remove(handle);
+            s.tcp_conns.remove(&id);
         }
     }
 }
 
-async fn service_udp(stack: &mut NetStack) {
-    let ids: Vec<usize> = stack.udp_conns.keys().copied().collect();
-    let idle_timeout = udp_idle_timeout();
+async fn service_udp(s: &mut NetStack) {
+    let ids: Vec<usize> = s.udp_conns.keys().copied().collect();
 
     for id in ids {
-        let handle = match stack.udp_conns.get(&id) {
-            Some(state) => state.handle,
+        let handle = match s.udp_conns.get(&id) {
+            Some(st) => st.handle,
             None => continue,
         };
 
-        if stack.udp_conns[&id].last_activity.elapsed() >= idle_timeout {
-            let state = stack.udp_conns.remove(&id).unwrap();
-            stack.sockets.remove(state.handle);
-            log::debug!("expired idle netstack UDP association {id}");
-            continue;
-        }
-
-        let mut packets = Vec::new();
+        let mut packets: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
         {
-            let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+            let socket = s.sockets.get_mut::<udp::Socket>(handle);
             while socket.can_recv() && packets.len() < MAX_RECV_CHUNKS {
                 match socket.recv() {
-                    Ok((data, metadata)) => {
-                        packets.push((
-                            endpoint_to_socketaddr(metadata.endpoint),
-                            data.to_vec(),
-                        ));
+                    Ok((data, meta)) => {
+                        packets.push((endpoint_to_socketaddr(meta.endpoint), data.to_vec()));
                     }
                     Err(_) => break,
                 }
             }
         }
 
-        if !packets.is_empty() {
-            if let Some(state) = stack.udp_conns.get_mut(&id) {
-                state.last_activity = StdInstant::now();
-            }
-        }
-
-        let to_app = stack.udp_conns[&id].to_app.clone();
-        let mut app_gone = false;
-        for packet in packets {
-            if to_app.send(packet).await.is_err() {
-                app_gone = true;
+        let to_app = s.udp_conns[&id].to_app.clone();
+        for p in packets {
+            if to_app.send(p).await.is_err() {
                 break;
             }
         }
-        if app_gone {
-            if let Some(state) = stack.udp_conns.remove(&id) {
-                stack.sockets.remove(state.handle);
-            }
+    }
+}
+
+async fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
+    while let Some(pkt) = s.device.tx.pop_front() {
+        if outbound_tx.send(pkt).await.is_err() {
+            return;
         }
-    }
-}
-
-async fn flush_tx(
-    stack: &mut NetStack,
-    outbound_tx: &mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
-    while let Some(packet) = stack.device.tx.pop_front() {
-        outbound_tx
-            .send(packet)
-            .await
-            .map_err(|_| AetherError::Other("tunnel output channel closed".into()))?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn address_parsers_reject_invalid_prefixes() {
-        assert!(parse_v4("172.16.0.2/32").is_ok());
-        assert!(parse_v4("172.16.0.2/33").is_err());
-        assert!(parse_v6("2606:4700::1/128").is_ok());
-        assert!(parse_v6("2606:4700::1/129").is_err());
-    }
-
-    #[test]
-    fn mtu_bounds_reject_invalid_values() {
-        assert!(!(MIN_TUNNEL_MTU..=MAX_TUNNEL_MTU).contains(&0));
-        assert!((MIN_TUNNEL_MTU..=MAX_TUNNEL_MTU).contains(&1280));
     }
 }

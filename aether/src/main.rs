@@ -871,11 +871,12 @@ async fn run_wireguard(
         }
     }
 
-    let (mode_string, ip_mode) = if forced.is_some() || quick.is_some() {
-        (String::new(), prober::IpScan::V4)
-    } else {
-        (select_scan_mode_str().await, select_ip_version().await)
-    };
+    // A cached/forced peer skips the initial scan, but a later recovery scan
+    // must still honor the mode and IP policy supplied on the command line.
+    // Previously a cached peer left these empty/defaulted, turning an Android
+    // `--turbo --dual` request into a balanced IPv4-only fallback scan.
+    let mode_string = select_scan_mode_str().await;
+    let ip_mode = select_ip_version().await;
 
     let mut last_good: Option<(SocketAddr, aethernoize::AetherNoizeConfig, String)> = None;
     let mut consecutive_failures: u32 = 0;

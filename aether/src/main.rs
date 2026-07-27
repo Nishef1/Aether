@@ -21,7 +21,7 @@ mod tunnelping;
 mod wg_prober;
 mod wireguard;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use error::{AetherError, Result};
@@ -38,19 +38,6 @@ fn parse_local_v4(value: &str) -> Result<Ipv4Addr> {
     if address.is_unspecified() {
         return Err(AetherError::Other(format!(
             "unspecified IPv4 identity address '{value}'"
-        )));
-    }
-    Ok(address)
-}
-
-fn parse_local_v6(value: &str) -> Result<Ipv6Addr> {
-    let raw = value.split('/').next().unwrap_or(value).trim();
-    let address: Ipv6Addr = raw
-        .parse()
-        .map_err(|_| AetherError::Other(format!("invalid IPv6 identity address '{value}'")))?;
-    if address.is_unspecified() {
-        return Err(AetherError::Other(format!(
-            "unspecified IPv6 identity address '{value}'"
         )));
     }
     Ok(address)
@@ -1017,12 +1004,11 @@ async fn run_wireguard_tunnel(
     let private_key = identity.private_key_bytes()?;
     let peer_public_key = identity.peer_public_key_bytes()?;
     let local_ipv4 = parse_local_v4(&identity.ipv4)?;
-    let local_ipv6 = parse_local_v6(&identity.ipv6)?;
 
     log::info!(
-        "[*] validating WireGuard endpoint with a disposable probe session before exposing socks5..."
+        "[*] validating WireGuard tunnel with {peer} (handshake + data-plane) before exposing socks5..."
     );
-    wireguard::verify_endpoint(
+    let (_, session) = wireguard::verify_endpoint_keep_session(
         peer,
         private_key,
         peer_public_key,
@@ -1034,25 +1020,20 @@ async fn run_wireguard_tunnel(
     )
     .await
     .map_err(|error| AetherError::Other(format!("tunnel failed validation: {error}")))?;
-    log::info!("[+] wireguard endpoint validated with disposable probe session; starting fresh runtime session");
-
-    let runtime_config = wireguard::WgConfig {
-        local_private_key: private_key,
-        peer_public_key,
-        peer_endpoint: peer,
-        local_ipv4,
-        local_ipv6,
-        client_id: identity.client_id,
-        preshared_key: None,
-        persistent_keepalive: Some(wg_keepalive_secs()),
-        aethernoize: std::sync::Arc::new(aethernoize),
-    };
+    log::info!(
+        "[+] wireguard tunnel validated (end-to-end data confirmed); validated session retained for runtime handoff"
+    );
 
     let (outbound_tx, outbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
     let (inbound_tx, inbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
-    let tunnel = wireguard::WgTunnel::new(runtime_config, inbound_tx).await?;
+    let tunnel = wireguard::WgTunnel::from_established(
+        session,
+        std::sync::Arc::new(aethernoize),
+        inbound_tx,
+        local_ipv4,
+    );
     let stack = netstack::spawn(
         &identity.ipv4,
         &identity.ipv6,
@@ -1062,10 +1043,6 @@ async fn run_wireguard_tunnel(
     )?;
 
     let mut tunnel_task = tokio::spawn(tunnel.run(outbound_rx));
-    if let Err(error) = warm_up_wg_stack(&stack, "wireguard").await {
-        tunnel_task.abort();
-        return Err(error);
-    }
     let socks_stack = stack.clone();
     let mut socks_task = tokio::spawn(async move {
         log::info!("[+] socks5 server listening on {listen}");
@@ -1092,75 +1069,6 @@ impl Drop for RunningWireGuard {
     }
 }
 
-async fn warm_up_wg_stack(stack: &netstack::StackHandle, label: &str) -> Result<()> {
-    const ATTEMPTS: usize = 3;
-    const HTTP_WARMUP_TIMEOUT: Duration = Duration::from_secs(8);
-    const HTTP_WARMUP_PORT: u16 = 80;
-    let mut last_error = None;
-
-    for attempt in 1..=ATTEMPTS {
-        let result = async {
-            let address = socks::dns_resolve(stack, "www.cloudflare.com").await?;
-            // A DNS response and a TCP handshake alone are insufficient: the
-            // Android SOCKS client can still fail on its first application
-            // request. Require a small HTTP response through this exact fresh
-            // netstack before exposing SOCKS, so the core can retry or rescan
-            // the endpoint rather than Android finalizing the process.
-            let target = SocketAddr::new(address, HTTP_WARMUP_PORT);
-            let mut connection = tokio::time::timeout(HTTP_WARMUP_TIMEOUT, stack.open_tcp(target))
-                .await
-                .map_err(|_| {
-                    AetherError::Other(format!(
-                        "HTTP warm-up TCP connect to {target} timed out after {HTTP_WARMUP_TIMEOUT:?}"
-                    ))
-                })??;
-            connection
-                .send(
-                    b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n"
-                        .to_vec(),
-                )
-                .await?;
-            let response = tokio::time::timeout(HTTP_WARMUP_TIMEOUT, connection.from_stack.recv())
-                .await
-                .map_err(|_| {
-                    AetherError::Other(format!(
-                        "HTTP warm-up response from {target} timed out after {HTTP_WARMUP_TIMEOUT:?}"
-                    ))
-                })?
-                .ok_or_else(|| AetherError::Other("HTTP warm-up connection closed without a response".into()))?;
-            if !response.starts_with(b"HTTP/") {
-                return Err(AetherError::Other("HTTP warm-up received an invalid response".into()));
-            }
-            connection.close().await;
-            Ok::<(IpAddr, SocketAddr), AetherError>((address, target))
-        }
-        .await;
-
-        match result {
-            Ok((address, target)) => {
-                log::info!(
-                    "[+] [{label}] fresh WireGuard runtime data-plane ready via DNS {address} and HTTP {target}"
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                log::warn!(
-                    "[-] [{label}] fresh runtime warm-up attempt {attempt}/{ATTEMPTS} failed: {error}"
-                );
-                last_error = Some(error.to_string());
-                if attempt < ATTEMPTS {
-                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
-                }
-            }
-        }
-    }
-
-    Err(AetherError::Other(format!(
-        "[{label}] fresh runtime data-plane warm-up failed: {}",
-        last_error.unwrap_or_else(|| "unknown error".to_string())
-    )))
-}
-
 async fn establish_wg(
     identity: &account::Identity,
     peer: SocketAddr,
@@ -1172,7 +1080,6 @@ async fn establish_wg(
     let private_key = identity.private_key_bytes()?;
     let peer_public_key = identity.peer_public_key_bytes()?;
     let local_ipv4 = parse_local_v4(&identity.ipv4)?;
-    let local_ipv6 = parse_local_v6(&identity.ipv6)?;
 
     let profile = if obfuscate {
         aethernoize_config()
@@ -1181,9 +1088,9 @@ async fn establish_wg(
     };
 
     log::info!(
-        "[*] [{label}] validating WireGuard endpoint with a disposable probe session..."
+        "[*] [{label}] validating WireGuard tunnel with {peer} (handshake + data-plane)..."
     );
-    wireguard::verify_endpoint(
+    let (_, session) = wireguard::verify_endpoint_keep_session(
         peer,
         private_key,
         peer_public_key,
@@ -1197,25 +1104,20 @@ async fn establish_wg(
     .map_err(|error| {
         AetherError::Other(format!("[{label}] tunnel failed validation: {error}"))
     })?;
-    log::info!("[+] [{label}] wireguard endpoint validated with disposable probe session; starting fresh runtime session");
-
-    let runtime_config = wireguard::WgConfig {
-        local_private_key: private_key,
-        peer_public_key,
-        peer_endpoint: peer,
-        local_ipv4,
-        local_ipv6,
-        client_id: identity.client_id,
-        preshared_key: None,
-        persistent_keepalive: Some(keepalive.clamp(1, 120)),
-        aethernoize: std::sync::Arc::new(profile),
-    };
+    log::info!(
+        "[+] [{label}] wireguard tunnel validated (end-to-end data confirmed); validated session retained for runtime handoff"
+    );
 
     let (outbound_tx, outbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
     let (inbound_tx, inbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
-    let tunnel = wireguard::WgTunnel::new(runtime_config, inbound_tx).await?;
+    let tunnel = wireguard::WgTunnel::from_established(
+        session,
+        std::sync::Arc::new(profile),
+        inbound_tx,
+        local_ipv4,
+    );
     let stack = netstack::spawn(
         &identity.ipv4,
         &identity.ipv6,
@@ -1224,10 +1126,6 @@ async fn establish_wg(
         outbound_tx,
     )?;
     let task = tokio::spawn(tunnel.run(outbound_rx));
-    if let Err(error) = warm_up_wg_stack(&stack, label).await {
-        task.abort();
-        return Err(error);
-    }
 
     Ok(RunningWireGuard { stack, task })
 }

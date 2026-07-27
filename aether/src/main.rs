@@ -1093,13 +1093,52 @@ impl Drop for RunningWireGuard {
 
 async fn warm_up_wg_stack(stack: &netstack::StackHandle, label: &str) -> Result<()> {
     const ATTEMPTS: usize = 3;
+    const HTTP_WARMUP_TIMEOUT: Duration = Duration::from_secs(8);
+    const HTTP_WARMUP_PORT: u16 = 80;
     let mut last_error = None;
 
     for attempt in 1..=ATTEMPTS {
-        match socks::dns_resolve(stack, "www.cloudflare.com").await {
-            Ok(address) => {
+        let result = async {
+            let address = socks::dns_resolve(stack, "www.cloudflare.com").await?;
+            // A DNS response and a TCP handshake alone are insufficient: the
+            // Android SOCKS client can still fail on its first application
+            // request. Require a small HTTP response through this exact fresh
+            // netstack before exposing SOCKS, so the core can retry or rescan
+            // the endpoint rather than Android finalizing the process.
+            let target = SocketAddr::new(address, HTTP_WARMUP_PORT);
+            let mut connection = tokio::time::timeout(HTTP_WARMUP_TIMEOUT, stack.open_tcp(target))
+                .await
+                .map_err(|_| {
+                    AetherError::Other(format!(
+                        "HTTP warm-up TCP connect to {target} timed out after {HTTP_WARMUP_TIMEOUT:?}"
+                    ))
+                })??;
+            connection
+                .send(
+                    b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n"
+                        .to_vec(),
+                )
+                .await?;
+            let response = tokio::time::timeout(HTTP_WARMUP_TIMEOUT, connection.from_stack.recv())
+                .await
+                .map_err(|_| {
+                    AetherError::Other(format!(
+                        "HTTP warm-up response from {target} timed out after {HTTP_WARMUP_TIMEOUT:?}"
+                    ))
+                })?
+                .ok_or_else(|| AetherError::Other("HTTP warm-up connection closed without a response".into()))?;
+            if !response.starts_with(b"HTTP/") {
+                return Err(AetherError::Other("HTTP warm-up received an invalid response".into()));
+            }
+            connection.close().await;
+            Ok::<(IpAddr, SocketAddr), AetherError>((address, target))
+        }
+        .await;
+
+        match result {
+            Ok((address, target)) => {
                 log::info!(
-                    "[+] [{label}] fresh WireGuard runtime data-plane ready via {address}"
+                    "[+] [{label}] fresh WireGuard runtime data-plane ready via DNS {address} and HTTP {target}"
                 );
                 return Ok(());
             }

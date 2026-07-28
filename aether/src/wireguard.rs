@@ -20,7 +20,12 @@ const DEFAULT_WG_STARTUP_SECS: u64 = 45;
 
 const WG_MSG_TYPE_MIN: u8 = 1;
 const WG_MSG_TYPE_MAX: u8 = 4;
-const DATAPLANE_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+// Validate real internet egress rather than Cloudflare's own 1.1.1.1 service.
+// Some edge addresses answer the internal DNS probe while dropping general traffic.
+const DATAPLANE_DNS_SERVERS: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(8, 8, 8, 8),
+    Ipv4Addr::new(9, 9, 9, 9),
+];
 const DATAPLANE_RESEND_INTERVAL: Duration = Duration::from_millis(900);
 
 fn inject_client_id(packet: &mut [u8], client_id: &[u8; 3]) {
@@ -333,7 +338,11 @@ impl WgTunnel {
         let health_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(health_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let probe = build_dataplane_probe(local_ipv4);
+            let probes = DATAPLANE_DNS_SERVERS
+                .iter()
+                .copied()
+                .map(|server| build_dataplane_probe(local_ipv4, server))
+                .collect::<Vec<_>>();
             let mut output = vec![0u8; MAX_PACKET];
             loop {
                 interval.tick().await;
@@ -357,14 +366,16 @@ impl WgTunnel {
                     continue;
                 }
                 let mut tunn = tunn_h.lock().await;
-                send_dataplane_probe(
-                    &sock_h,
-                    &mut tunn,
-                    &client_id_h,
-                    &probe,
-                    &mut output,
-                )
-                .await?;
+                for probe in &probes {
+                    send_dataplane_probe(
+                        &sock_h,
+                        &mut tunn,
+                        &client_id_h,
+                        probe,
+                        &mut output,
+                    )
+                    .await?;
+                }
             }
         });
 
@@ -460,6 +471,7 @@ struct DataplaneProbe {
     dns_id: u16,
     source_port: u16,
     source_ip: Ipv4Addr,
+    dns_server: Ipv4Addr,
 }
 
 fn build_dns_query(id: u16) -> Vec<u8> {
@@ -494,7 +506,7 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn build_dataplane_probe(source: Ipv4Addr) -> DataplaneProbe {
+fn build_dataplane_probe(source: Ipv4Addr, dns_server: Ipv4Addr) -> DataplaneProbe {
     let dns_id: u16 = rand::random();
     let source_port: u16 = rand::thread_rng().gen_range(20_000..60_000);
     let dns = build_dns_query(dns_id);
@@ -511,7 +523,7 @@ fn build_dataplane_probe(source: Ipv4Addr) -> DataplaneProbe {
     packet.push(17);
     packet.extend_from_slice(&[0x00, 0x00]);
     packet.extend_from_slice(&source.octets());
-    packet.extend_from_slice(&DATAPLANE_DNS.octets());
+    packet.extend_from_slice(&dns_server.octets());
     let checksum = ipv4_checksum(&packet[0..20]);
     packet[10..12].copy_from_slice(&checksum.to_be_bytes());
     packet.extend_from_slice(&source_port.to_be_bytes());
@@ -525,6 +537,7 @@ fn build_dataplane_probe(source: Ipv4Addr) -> DataplaneProbe {
         dns_id,
         source_port,
         source_ip: source,
+        dns_server,
     }
 }
 
@@ -536,7 +549,7 @@ fn is_matching_dataplane_response(packet: &[u8], probe: &DataplaneProbe) -> bool
     if header_len < 20 || packet.len() < header_len + 8 + 12 || packet[9] != 17 {
         return false;
     }
-    if packet[12..16] != DATAPLANE_DNS.octets()
+    if packet[12..16] != probe.dns_server.octets()
         || packet[16..20] != probe.source_ip.octets()
     {
         return false;
@@ -589,21 +602,31 @@ async fn verify_dataplane(
     start: Instant,
     deadline: Instant,
 ) -> Result<Duration> {
-    let probe = build_dataplane_probe(local_ipv4);
+    let probes = DATAPLANE_DNS_SERVERS
+        .iter()
+        .copied()
+        .map(|server| build_dataplane_probe(local_ipv4, server))
+        .collect::<Vec<_>>();
     let mut output = vec![0u8; MAX_PACKET];
     let mut recv_buffer = vec![0u8; MAX_PACKET];
     let mut temporary = vec![0u8; MAX_PACKET];
 
-    send_dataplane_probe(sock, tunn, client_id, &probe, &mut output).await?;
+    for probe in &probes {
+        send_dataplane_probe(sock, tunn, client_id, probe, &mut output).await?;
+    }
     let mut resend_at = Instant::now() + DATAPLANE_RESEND_INTERVAL;
 
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err(AetherError::Other("dataplane timeout".into()));
+            return Err(AetherError::Other(
+                "independent resolver egress timeout".into(),
+            ));
         }
         if now >= resend_at {
-            send_dataplane_probe(sock, tunn, client_id, &probe, &mut output).await?;
+            for probe in &probes {
+                send_dataplane_probe(sock, tunn, client_id, probe, &mut output).await?;
+            }
             resend_at = now + DATAPLANE_RESEND_INTERVAL;
         }
         let wait = deadline
@@ -619,7 +642,7 @@ async fn verify_dataplane(
                 if batch
                     .tunnel_packets
                     .iter()
-                    .any(|packet| is_matching_dataplane_response(packet, &probe))
+                    .any(|packet| probes.iter().any(|probe| is_matching_dataplane_response(packet, probe)))
                 {
                     return Ok(start.elapsed());
                 }
@@ -748,44 +771,20 @@ pub async fn verify_endpoint_keep_session(
     }
 }
 
-pub const WG_PREFIXES_V4: &[&str] = &[
-    "162.159.192.0/24",
-    "162.159.193.0/24",
-    "162.159.195.0/24",
-    "188.114.96.0/24",
-    "188.114.97.0/24",
-    "188.114.98.0/24",
-    "188.114.99.0/24",
-];
+// Android bounded official WARP scan: consumer WARP uses the documented
+// ingress pool and the four documented WireGuard UDP ports. Compatibility
+// ranges remain an upstream concern and are not scanned by the mobile build.
+pub const WG_PREFIXES_V4: &[&str] = &["162.159.192.0/24"];
+pub const WG_PRIMARY_PREFIXES_V4: &[&str] = WG_PREFIXES_V4;
+pub const WG_PREFIXES_V6: &[&str] = &["2606:4700:100::/48"];
+pub const WG_PRIMARY_PREFIXES_V6: &[&str] = WG_PREFIXES_V6;
 
-pub const WG_PRIMARY_PREFIXES_V4: &[&str] = &["162.159.192.0/24", "162.159.193.0/24"];
-pub const WG_PREFIXES_V6: &[&str] = &[
-    "2606:4700:100::/48",
-    "2606:4700:d0::/64",
-    "2606:4700:d1::/64",
-];
-pub const WG_PRIMARY_PREFIXES_V6: &[&str] = &["2606:4700:100::/48"];
+pub const WG_PORTS: &[u16] = &[2408, 500, 1701, 4500];
+pub const WG_PRIMARY_PORTS: &[u16] = WG_PORTS;
 
-pub const WG_PORTS: &[u16] = &[
-    2408, 500, 1701, 4500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 934,
-    939, 942, 943, 945, 946, 955, 968, 987, 988, 1002, 1010, 1014, 1018, 1070, 1074,
-    1180, 1387, 1843, 2371, 2506, 3138, 3476, 3581, 3854, 4177, 4198, 4233, 5279,
-    5956, 7103, 7152, 7156, 7281, 7559, 8319, 8742, 8854, 8886,
-];
-pub const WG_PRIMARY_PORTS: &[u16] = &[2408, 500, 1701, 4500];
+pub const WG_SEEDS_V4: &[&str] = &["162.159.192.1", "162.159.192.2"];
 
-pub const WG_SEEDS_V4: &[&str] = &[
-    "162.159.192.1",
-    "162.159.193.1",
-    "162.159.192.2",
-    "162.159.193.2",
-];
-
-pub const WG_SEEDS_V6: &[&str] = &[
-    "2606:4700:100::1",
-    "2606:4700:d0::a29f:c001",
-    "2606:4700:d1::a29f:c001",
-];
+pub const WG_SEEDS_V6: &[&str] = &["2606:4700:100::1"];
 
 #[cfg(test)]
 mod tests {
@@ -812,7 +811,17 @@ mod tests {
 
     #[test]
     fn dataplane_response_validation_rejects_unrelated_packets() {
-        let probe = build_dataplane_probe(Ipv4Addr::new(172, 16, 0, 2));
+        let probe = build_dataplane_probe(
+            Ipv4Addr::new(172, 16, 0, 2),
+            DATAPLANE_DNS_SERVERS[0],
+        );
         assert!(!is_matching_dataplane_response(&probe.packet, &probe));
+    }
+
+    #[test]
+    fn dataplane_probes_use_independent_resolvers() {
+        assert!(!DATAPLANE_DNS_SERVERS.contains(&Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(DATAPLANE_DNS_SERVERS.contains(&Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(DATAPLANE_DNS_SERVERS.contains(&Ipv4Addr::new(9, 9, 9, 9)));
     }
 }

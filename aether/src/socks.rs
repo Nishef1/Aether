@@ -137,20 +137,65 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
 }
 
 pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
+    // runtime DNS uses validated independent resolvers. The WireGuard dataplane
+    // validator already proved that at least one independent destination is reachable;
+    // 1.1.1.1 remains only as a compatibility fallback so the working MASQUE path
+    // is preserved without making WARP runtime readiness depend on it exclusively.
+    const TIMEOUT: Duration = Duration::from_secs(6);
+    let servers = [
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 53),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+    ];
+
     let udp = stack.open_udp().await?;
-    let server: SocketAddr = "1.1.1.1:53".parse().unwrap();
-
     let query = build_dns_query(name, 1);
-    udp.send_to(server, query).await?;
+    let mut sent = 0usize;
+    for server in servers {
+        if udp.send_to(server, query.clone()).await.is_ok() {
+            sent += 1;
+        }
+    }
+    if sent == 0 {
+        udp.close().await;
+        return Err(AetherError::Other(
+            "dns query could not be sent to any resolver".into(),
+        ));
+    }
 
-    let (_sender, mut from_stack) = udp.into_split();
+    let (sender, mut from_stack) = udp.into_split();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            sender.close().await;
+            return Err(AetherError::Other(
+                "dns timeout across resolver race".into(),
+            ));
+        }
 
-    let resp = tokio::time::timeout(Duration::from_secs(5), from_stack.recv())
-        .await
-        .map_err(|_| AetherError::Other("dns timeout".into()))?
-        .ok_or_else(|| AetherError::Other("dns channel closed".into()))?;
+        let response = match tokio::time::timeout(remaining, from_stack.recv()).await {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                sender.close().await;
+                return Err(AetherError::Other("dns channel closed".into()));
+            }
+            Err(_) => {
+                sender.close().await;
+                return Err(AetherError::Other(
+                    "dns timeout across resolver race".into(),
+                ));
+            }
+        };
 
-    parse_dns_a(&resp.1).ok_or_else(|| AetherError::Other(format!("no A record for {name}")))
+        if !servers.contains(&response.0) {
+            continue;
+        }
+        if let Some(address) = parse_dns_a(&response.1) {
+            sender.close().await;
+            return Ok(address);
+        }
+    }
 }
 
 fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {

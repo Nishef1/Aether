@@ -1004,36 +1004,34 @@ async fn run_wireguard_tunnel(
     let private_key = identity.private_key_bytes()?;
     let peer_public_key = identity.peer_public_key_bytes()?;
     let local_ipv4 = parse_local_v4(&identity.ipv4)?;
+    let local_ipv6: std::net::Ipv6Addr = identity
+        .ipv6
+        .parse()
+        .map_err(|_| AetherError::Other("invalid ipv6".into()))?;
 
+    // Android fresh WireGuard runtime: the scanner proves that the endpoint is
+    // reachable, but its probe socket/session is deliberately not reused. The
+    // first real SOCKS request drives a clean BoringTun handshake on this runtime.
     log::info!(
-        "[*] validating WireGuard tunnel with {peer} (handshake + data-plane) before exposing socks5..."
+        "[*] starting fresh WireGuard runtime with {peer} (endpoint verified during scan)"
     );
-    let (_, session) = wireguard::verify_endpoint_keep_session(
-        peer,
-        private_key,
+    let config = wireguard::WgConfig {
+        local_private_key: private_key,
         peer_public_key,
-        identity.client_id,
+        peer_endpoint: peer,
         local_ipv4,
-        &aethernoize,
-        wg_tunnel_validate_timeout(),
-        Some(wg_keepalive_secs()),
-    )
-    .await
-    .map_err(|error| AetherError::Other(format!("tunnel failed validation: {error}")))?;
-    log::info!(
-        "[+] wireguard tunnel validated (end-to-end data confirmed); validated session retained for runtime handoff"
-    );
+        local_ipv6,
+        client_id: identity.client_id,
+        preshared_key: None,
+        persistent_keepalive: Some(wg_keepalive_secs()),
+        aethernoize: std::sync::Arc::new(aethernoize),
+    };
 
     let (outbound_tx, outbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
     let (inbound_tx, inbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
-    let tunnel = wireguard::WgTunnel::from_established(
-        session,
-        std::sync::Arc::new(aethernoize),
-        inbound_tx,
-        local_ipv4,
-    );
+    let tunnel = wireguard::WgTunnel::new(config, inbound_tx).await?;
     let stack = netstack::spawn(
         &identity.ipv4,
         &identity.ipv6,
@@ -1080,6 +1078,10 @@ async fn establish_wg(
     let private_key = identity.private_key_bytes()?;
     let peer_public_key = identity.peer_public_key_bytes()?;
     let local_ipv4 = parse_local_v4(&identity.ipv4)?;
+    let local_ipv6: std::net::Ipv6Addr = identity
+        .ipv6
+        .parse()
+        .map_err(|_| AetherError::Other("invalid ipv6".into()))?;
 
     let profile = if obfuscate {
         aethernoize_config()
@@ -1087,37 +1089,26 @@ async fn establish_wg(
         aethernoize::from_profile("off")
     };
 
-    log::info!(
-        "[*] [{label}] validating WireGuard tunnel with {peer} (handshake + data-plane)..."
-    );
-    let (_, session) = wireguard::verify_endpoint_keep_session(
-        peer,
-        private_key,
+    // Android fresh WireGuard runtime: outer and inner Gool layers each own an
+    // independent BoringTun state machine and UDP socket from their first packet.
+    log::info!("[*] [{label}] starting fresh WireGuard runtime with {peer}");
+    let config = wireguard::WgConfig {
+        local_private_key: private_key,
         peer_public_key,
-        identity.client_id,
+        peer_endpoint: peer,
         local_ipv4,
-        &profile,
-        wg_tunnel_validate_timeout(),
-        Some(keepalive.clamp(1, 120)),
-    )
-    .await
-    .map_err(|error| {
-        AetherError::Other(format!("[{label}] tunnel failed validation: {error}"))
-    })?;
-    log::info!(
-        "[+] [{label}] wireguard tunnel validated (end-to-end data confirmed); validated session retained for runtime handoff"
-    );
+        local_ipv6,
+        client_id: identity.client_id,
+        preshared_key: None,
+        persistent_keepalive: Some(keepalive.clamp(1, 120)),
+        aethernoize: std::sync::Arc::new(profile),
+    };
 
     let (outbound_tx, outbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
     let (inbound_tx, inbound_rx) =
         tokio::sync::mpsc::channel(sysprofile::channel_capacity());
-    let tunnel = wireguard::WgTunnel::from_established(
-        session,
-        std::sync::Arc::new(profile),
-        inbound_tx,
-        local_ipv4,
-    );
+    let tunnel = wireguard::WgTunnel::new(config, inbound_tx).await?;
     let stack = netstack::spawn(
         &identity.ipv4,
         &identity.ipv6,
@@ -1209,7 +1200,7 @@ async fn run_warp_in_warp(
     peer: SocketAddr,
     listen: SocketAddr,
 ) -> Result<()> {
-    log::info!("[*] establishing outer WARP tunnel to {peer}...");
+    log::info!("[*] establishing fresh outer WARP runtime to {peer}...");
     let mut outer = establish_wg(
         &primary,
         peer,
@@ -1220,13 +1211,17 @@ async fn run_warp_in_warp(
     )
     .await?;
 
+    // fresh outer runtime settle: retain the proven v1.3/Android startup order
+    // before routing the inner handshake through the outer userspace stack.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
     let mut forwarder = spawn_udp_forwarder(&outer.stack, peer).await?;
     log::info!(
-        "[+] inner endpoint tunneled through outer warp via {}",
+        "[+] inner endpoint {peer} tunneled through outer warp via {}",
         forwarder.local_address
     );
 
-    log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
+    log::info!("[*] establishing fresh inner WARP runtime (warp-in-warp)...");
     let mut inner = establish_wg(
         &secondary,
         forwarder.local_address,

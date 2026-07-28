@@ -148,14 +148,17 @@ impl ScanMode {
     fn strategy(&self) -> Strategy {
         match self {
             ScanMode::Turbo => Strategy {
+                // Android auto H2 latency window: wait briefly after the first
+                // verified gateway so Auto can choose the lowest-latency result
+                // without turning a normal connection into a long scan.
                 concurrency: 20,
                 per_probe_timeout: Duration::from_secs(4),
-                overall_deadline: Duration::from_secs(20),
-                settle_after_target: Duration::ZERO,
+                overall_deadline: Duration::from_secs(8),
+                settle_after_target: Duration::from_millis(650),
                 target_successes: 1,
-                early_exit_first: true,
+                early_exit_first: false,
                 sample_per_cidr: 24,
-                finalists: 1,
+                finalists: 4,
                 finalist_attempts: 1,
                 secondary_port_passes: 0,
                 include_compat_ranges: false,

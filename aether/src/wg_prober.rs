@@ -111,17 +111,20 @@ impl WgScanMode {
                 compatibility_ports: 0,
             },
             WgScanMode::Ironclad => WgStrategy {
+                // Android bounded official WARP scan: explicit WireGuard/Gool
+                // still require real HTTP egress, but should fail clearly rather
+                // than cycling through thousands of compatibility endpoints.
                 concurrency: 8,
-                per_probe_timeout: Duration::from_secs(10),
-                overall_deadline: Duration::from_secs(150),
-                settle_after_target: Duration::from_secs(6),
-                target_successes: 12,
+                per_probe_timeout: Duration::from_secs(8),
+                overall_deadline: Duration::from_secs(60),
+                settle_after_target: Duration::from_secs(2),
+                target_successes: 6,
                 early_exit_first: false,
-                sample_per_cidr: 96,
+                sample_per_cidr: 64,
                 finalists: 4,
-                finalist_attempts: 3,
-                include_compatibility: true,
-                compatibility_ports: 4,
+                finalist_attempts: 2,
+                include_compatibility: false,
+                compatibility_ports: 0,
             },
         }
     }

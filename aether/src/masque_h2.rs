@@ -634,7 +634,7 @@ pub async fn run(
                                 AetherError::Masque(format!("h2 release capacity: {error}"))
                             })?;
                         capsules.push(&chunk);
-                        let got_data = drain_capsules(&mut capsules, &inbound_tx, &addr_tx).await?;
+                        let got_data = drain_capsules(&mut capsules, &inbound_tx, &addr_tx);
                         if got_data && !ready_fired {
                             validate_successes += 1;
                             log::debug!(
@@ -681,10 +681,9 @@ async fn send_capsule(send: &mut h2::SendStream<Bytes>, data: Bytes) -> Result<(
     }
 
     send.reserve_capacity(len);
-    loop {
+    while send.capacity() < len {
         match futures::future::poll_fn(|context| send.poll_capacity(context)).await {
-            Some(Ok(available)) if available >= len => break,
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             Some(Err(error)) => {
                 return Err(AetherError::Masque(format!("h2 capacity: {error}")));
             }
@@ -697,19 +696,30 @@ async fn send_capsule(send: &mut h2::SendStream<Bytes>, data: Bytes) -> Result<(
     Ok(())
 }
 
-async fn drain_capsules(
+fn drain_capsules(
     capsules: &mut CapsuleParser,
     inbound_tx: &mpsc::Sender<Vec<u8>>,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
-) -> Result<bool> {
+) -> bool {
     let mut delivered = false;
     loop {
         match capsules.next() {
-            Ok(Some(Capsule::Datagram(packet))) => {
+            Ok(Some(Capsule::Datagram(payload))) => {
+                let packet = match masque::strip_datagram_context(&payload) {
+                    Some(packet) => packet,
+                    None => {
+                        log::trace!("[h2] discarding a datagram that is not an ip packet");
+                        continue;
+                    }
+                };
                 delivered = true;
-                inbound_tx.send(packet).await.map_err(|_| {
-                    AetherError::Masque("netstack input channel closed".into())
-                })?;
+                match inbound_tx.try_send(packet) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        log::trace!("[h2] inbound queue full, dropping datagram");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return delivered,
+                }
             }
             Ok(Some(Capsule::AddressAssign(addrs))) => {
                 for address in addrs {
@@ -730,13 +740,12 @@ async fn drain_capsules(
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(error) => {
-                return Err(AetherError::Masque(format!(
-                    "malformed h2 capsule stream: {error}"
-                )));
+                log::trace!("[h2] capsule parse: {error}");
+                break;
             }
         }
     }
-    Ok(delivered)
+    delivered
 }
 
 fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {

@@ -232,7 +232,6 @@ pub async fn hunt_wg_endpoints(
                             break;
                         }
 
-
                         if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
                             log::info!("[+] reached target of {} endpoints, selecting best", st.target_successes);
                             if !st.quiet_after_first.is_zero() {
@@ -335,6 +334,25 @@ async fn verify_one_wg(
     }
 }
 
+fn interleave_wg_families(v4: &[Ipv4Addr], v6: &[Ipv6Addr], ip: IpScan) -> Vec<IpAddr> {
+    match ip {
+        IpScan::V4 => v4.iter().copied().map(IpAddr::V4).collect(),
+        IpScan::V6 => v6.iter().copied().map(IpAddr::V6).collect(),
+        IpScan::Both => {
+            let mut out = Vec::with_capacity(v4.len() + v6.len());
+            for index in 0..v4.len().max(v6.len()) {
+                if let Some(addr) = v4.get(index) {
+                    out.push(IpAddr::V4(*addr));
+                }
+                if let Some(addr) = v6.get(index) {
+                    out.push(IpAddr::V6(*addr));
+                }
+            }
+            out
+        }
+    }
+}
+
 fn build_wg_candidates(
     st: &WgStrategy,
     ports: &[u16],
@@ -351,13 +369,15 @@ fn build_wg_candidates(
         }
     };
 
-    let mut anchors: Vec<IpAddr> = Vec::new();
-    let mut pool: Vec<IpAddr> = Vec::new();
+    let mut anchors4: Vec<Ipv4Addr> = Vec::new();
+    let mut anchors6: Vec<Ipv6Addr> = Vec::new();
+    let mut pool4: Vec<Ipv4Addr> = Vec::new();
+    let mut pool6: Vec<Ipv6Addr> = Vec::new();
 
     if ip.want_v4() {
         for s in wireguard::wg_seeds_v4() {
             if let Ok(a) = s.parse::<Ipv4Addr>() {
-                anchors.push(IpAddr::V4(a));
+                anchors4.push(a);
             }
         }
         let cidr_hosts: Vec<Vec<Ipv4Addr>> = wireguard::wg_prefixes_v4()
@@ -374,7 +394,7 @@ fn build_wg_candidates(
         for i in 0..max_len {
             for hosts in &cidr_hosts {
                 if let Some(a) = hosts.get(i) {
-                    pool.push(IpAddr::V4(*a));
+                    pool4.push(*a);
                 }
             }
         }
@@ -383,7 +403,7 @@ fn build_wg_candidates(
     if ip.want_v6() {
         for s in wireguard::WG_SEEDS_V6 {
             if let Ok(a) = s.parse::<Ipv6Addr>() {
-                anchors.push(IpAddr::V6(a));
+                anchors6.push(a);
             }
         }
         let per = if st.sample_per_cidr == 0 { 80 } else { st.sample_per_cidr };
@@ -395,11 +415,14 @@ fn build_wg_candidates(
         for i in 0..max6 {
             for hosts in &cidr6 {
                 if let Some(a) = hosts.get(i) {
-                    pool.push(IpAddr::V6(*a));
+                    pool6.push(*a);
                 }
             }
         }
     }
+
+    let anchors = interleave_wg_families(&anchors4, &anchors6, ip);
+    let pool = interleave_wg_families(&pool4, &pool6, ip);
 
     let mut out: Vec<(IpAddr, u16)> = Vec::new();
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
@@ -412,8 +435,8 @@ fn build_wg_candidates(
     };
 
     let mut ips: Vec<IpAddr> = Vec::with_capacity(anchors.len() + pool.len());
-    ips.extend(anchors.iter().copied());
-    ips.extend(pool.iter().copied());
+    ips.extend(anchors);
+    ips.extend(pool);
 
     for wave in 0..st.pool_port_waves.max(1) {
         for (idx, candidate_ip) in ips.iter().enumerate() {
@@ -528,6 +551,17 @@ mod tests {
                 "anchor {ip} should be tried once, on a port of its own"
             );
         }
+    }
+
+    #[test]
+    fn dual_stack_scan_head_interleaves_anchor_families() {
+        let strategy = WgScanMode::Turbo.strategy();
+        let candidates = build_wg_candidates(&strategy, &[2408], IpScan::Both, &HashSet::new());
+        assert!(candidates.len() >= 4);
+        assert!(candidates[0].0.is_ipv4());
+        assert!(candidates[1].0.is_ipv6());
+        assert!(candidates[2].0.is_ipv4());
+        assert!(candidates[3].0.is_ipv6());
     }
 
     #[test]
@@ -657,4 +691,3 @@ mod tests {
         assert!(!candidates.contains(&(peer.ip(), peer.port())));
     }
 }
-

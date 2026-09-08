@@ -22,15 +22,31 @@ pub enum MaskMode {
 }
 
 impl MaskMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" | "none" => Some(Self::Off),
+            "legacy" | "fragment" | "tcp-fragment" => Some(Self::LegacyTcpFragment),
+            "clienthello" | "clienthello-split" | "tlshello" => Some(Self::ClientHelloTcpSplit),
+            "patterniha" | "patterniha-experimental" => Some(Self::PatternihaExperimental),
+            _ => None,
+        }
+    }
+
     fn from_env() -> Self {
         if let Ok(value) = std::env::var("AETHER_MASQUE_H2_MASK") {
-            return match value.trim().to_ascii_lowercase().as_str() {
-                "off" | "0" | "false" | "none" => Self::Off,
-                "legacy" | "fragment" | "tcp-fragment" => Self::LegacyTcpFragment,
-                "clienthello" | "clienthello-split" | "tlshello" => Self::ClientHelloTcpSplit,
-                "patterniha" | "patterniha-experimental" => Self::PatternihaExperimental,
-                _ => Self::Off,
-            };
+            return Self::parse(&value).unwrap_or(Self::Off);
+        }
+
+        // Android's compatibility bridge predates the explicit mask field. It
+        // can carry deterministic modes through the already-stable
+        // --fragment-size string without changing the Kotlin/native ABI.
+        if let Ok(value) = std::env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE") {
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "clienthello" | "clienthello-split" | "tlshello" | "patterniha" | "patterniha-experimental"
+            ) {
+                return Self::parse(&value).unwrap_or(Self::Off);
+            }
         }
 
         // Backward compatibility: existing GUI/CLI profiles only know the old
@@ -145,11 +161,7 @@ impl FragmentConfig {
         match self.mode {
             MaskMode::Off => Duration::ZERO,
             MaskMode::LegacyTcpFragment => self.pick_delay(),
-            // Plain deterministic ClientHello splitting changes write boundaries
-            // only; it does not add timing noise unless the legacy mode is used.
             MaskMode::ClientHelloTcpSplit => Duration::ZERO,
-            // The public experimental preset includes a 1 ms delay in its
-            // first-packet stage. Apply that only after entering the second pair.
             MaskMode::PatternihaExperimental if split_index >= 3 => Duration::from_millis(1),
             MaskMode::PatternihaExperimental => Duration::ZERO,
         }
@@ -274,25 +286,45 @@ where
 mod tests {
     use super::*;
 
+    fn clear_mask_env() {
+        std::env::remove_var("AETHER_MASQUE_H2_MASK");
+        std::env::remove_var("AETHER_MASQUE_H2_FRAGMENT");
+        std::env::remove_var("AETHER_MASQUE_H2_FRAGMENT_SIZE");
+    }
+
     #[test]
     fn old_fragment_switch_still_selects_legacy_mode() {
-        std::env::remove_var("AETHER_MASQUE_H2_MASK");
+        clear_mask_env();
         std::env::set_var("AETHER_MASQUE_H2_FRAGMENT", "1");
         let cfg = FragmentConfig::from_env();
-        std::env::remove_var("AETHER_MASQUE_H2_FRAGMENT");
+        clear_mask_env();
         assert_eq!(cfg.mode, MaskMode::LegacyTcpFragment);
         assert!(cfg.enabled);
     }
 
     #[test]
     fn explicit_off_beats_the_legacy_boolean() {
+        clear_mask_env();
         std::env::set_var("AETHER_MASQUE_H2_FRAGMENT", "1");
         std::env::set_var("AETHER_MASQUE_H2_MASK", "off");
         let cfg = FragmentConfig::from_env();
-        std::env::remove_var("AETHER_MASQUE_H2_FRAGMENT");
-        std::env::remove_var("AETHER_MASQUE_H2_MASK");
+        clear_mask_env();
         assert_eq!(cfg.mode, MaskMode::Off);
         assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn android_bridge_sentinel_selects_deterministic_mode() {
+        clear_mask_env();
+        std::env::set_var("AETHER_MASQUE_H2_FRAGMENT", "1");
+        std::env::set_var("AETHER_MASQUE_H2_FRAGMENT_SIZE", "clienthello");
+        let clienthello = FragmentConfig::from_env();
+        assert_eq!(clienthello.mode, MaskMode::ClientHelloTcpSplit);
+
+        std::env::set_var("AETHER_MASQUE_H2_FRAGMENT_SIZE", "patterniha");
+        let patterniha = FragmentConfig::from_env();
+        clear_mask_env();
+        assert_eq!(patterniha.mode, MaskMode::PatternihaExperimental);
     }
 
     #[test]

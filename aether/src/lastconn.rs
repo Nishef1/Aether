@@ -36,6 +36,13 @@ pub struct LastConnection {
     /// small and additive so old lastconn files continue to deserialize.
     #[serde(default)]
     pub failed: Vec<FailedEndpoint>,
+    /// Ordered fast-path candidates offered to the current quick reconnect.
+    /// `save()` resolves this against the eventual winner so only candidates
+    /// that were actually tried before the winner accrue a failure cooldown.
+    #[serde(default)]
+    pub pending_fast_path: Vec<String>,
+    #[serde(default)]
+    pub pending_fast_path_ms: u64,
     /// Runtime-only origin used to find the matching PathHistory file.
     #[serde(skip)]
     source_path: String,
@@ -121,30 +128,8 @@ fn record_history_failure(path: &str, peer: SocketAddr, profile: &str) {
     );
 }
 
-pub fn save(path: &str, peer: &str, profile: &str) {
-    let mut conn = load(path).unwrap_or_default();
-    conn.source_path = path.to_string();
-    conn.peer = peer.to_string();
-    conn.profile = profile.to_string();
-    conn.recent.retain(|p| p != peer);
-    conn.recent.insert(0, peer.to_string());
-    conn.recent.truncate(RECENT_CAP);
-    conn.failed.retain(|entry| entry.peer != peer);
-    conn.failed
-        .sort_by_key(|entry| std::cmp::Reverse(entry.last_failure_ms));
-    conn.failed.truncate(FAILURE_CAP);
-    persist(path, &conn);
-    record_history_success(path, peer, profile);
-}
-
-/// Record a failed fast-path verification and persist a bounded exponential
-/// cooldown. Fresh scans are still allowed to rediscover the endpoint later.
-pub fn record_failure(path: &str, peer: SocketAddr) {
-    let mut conn = load(path).unwrap_or_default();
-    conn.source_path = path.to_string();
+fn apply_failure(conn: &mut LastConnection, peer: SocketAddr, now: u64) {
     let peer_text = peer.to_string();
-    let now = now_ms();
-
     if let Some(entry) = conn.failed.iter_mut().find(|entry| entry.peer == peer_text) {
         entry.failures = entry.failures.saturating_add(1);
         entry.last_failure_ms = now;
@@ -159,6 +144,70 @@ pub fn record_failure(path: &str, peer: SocketAddr) {
             cooldown_until_ms: now.saturating_add(FAILURE_COOLDOWN_SECS[0] * 1000),
         });
     }
+}
+
+fn resolve_pending_fast_path(conn: &mut LastConnection, winner: &str, now: u64) -> Vec<SocketAddr> {
+    let pending = std::mem::take(&mut conn.pending_fast_path);
+    conn.pending_fast_path_ms = 0;
+    if pending.is_empty() {
+        return Vec::new();
+    }
+
+    // Fast-path callers verify candidates strictly in this recorded order and
+    // stop at the first success. Therefore every entry before a cached winner
+    // failed. If the eventual winner is not in this list, the reconnect ring
+    // was exhausted and a fresh scan won, so every pending cached peer failed.
+    let failed_len = pending
+        .iter()
+        .position(|candidate| candidate == winner)
+        .unwrap_or(pending.len());
+    let mut failed = Vec::new();
+    for candidate in pending.into_iter().take(failed_len) {
+        if let Ok(peer) = candidate.parse::<SocketAddr>() {
+            apply_failure(conn, peer, now);
+            failed.push(peer);
+        }
+    }
+    failed
+}
+
+pub fn save(path: &str, peer: &str, profile: &str) {
+    let mut conn = load(path).unwrap_or_default();
+    conn.source_path = path.to_string();
+    let now = now_ms();
+    let previous_profile = conn.profile.clone();
+    let failed_fast_path = resolve_pending_fast_path(&mut conn, peer, now);
+
+    conn.peer = peer.to_string();
+    conn.profile = profile.to_string();
+    conn.recent.retain(|p| p != peer);
+    conn.recent.insert(0, peer.to_string());
+    conn.recent.truncate(RECENT_CAP);
+    // A successful full tunnel always clears any old cooldown for its winner.
+    conn.failed.retain(|entry| entry.peer != peer);
+    conn.failed
+        .sort_by_key(|entry| std::cmp::Reverse(entry.last_failure_ms));
+    conn.failed.truncate(FAILURE_CAP);
+    persist(path, &conn);
+
+    let failed_profile = if previous_profile.trim().is_empty() {
+        profile
+    } else {
+        &previous_profile
+    };
+    for failed in failed_fast_path {
+        record_history_failure(path, failed, failed_profile);
+    }
+    record_history_success(path, peer, profile);
+}
+
+/// Record a failed fast-path verification and persist a bounded exponential
+/// cooldown. Fresh scans are still allowed to rediscover the endpoint later.
+pub fn record_failure(path: &str, peer: SocketAddr) {
+    let mut conn = load(path).unwrap_or_default();
+    conn.source_path = path.to_string();
+    let now = now_ms();
+    apply_failure(&mut conn, peer, now);
 
     conn.failed
         .sort_by_key(|entry| std::cmp::Reverse(entry.last_failure_ms));
@@ -181,7 +230,24 @@ fn is_cooled(cached: &LastConnection, peer: SocketAddr, now: u64) -> bool {
 /// then paths observed on this network are ordered by persistent quality/history;
 /// unseen peers retain their original recent-first order.
 pub fn recent_peers(cached: &LastConnection) -> Vec<SocketAddr> {
-    recent_peers_at(cached, now_ms())
+    let now = now_ms();
+    let out = recent_peers_at(cached, now);
+
+    // The GUI supplies an explicit quick-reconnect flag. Record the ordered
+    // offer only in that non-interactive case; interactive users who decline
+    // reconnect must not create false failures. The eventual save resolves the
+    // prefix that was actually attempted before a winner was found.
+    if env_truthy("AETHER_QUICK_RECONNECT")
+        && !cached.source_path.is_empty()
+        && !out.is_empty()
+    {
+        let mut pending = cached.clone();
+        pending.pending_fast_path = out.iter().map(ToString::to_string).collect();
+        pending.pending_fast_path_ms = now;
+        persist(&cached.source_path, &pending);
+    }
+
+    out
 }
 
 fn recent_peers_at(cached: &LastConnection, now: u64) -> Vec<SocketAddr> {
@@ -239,6 +305,7 @@ mod tests {
         assert_eq!(loaded.peer, "1.1.1.1:443", "peer stays the latest");
         assert_eq!(loaded.recent, vec!["1.1.1.1:443", "1.0.0.1:443"]);
         assert!(loaded.failed.is_empty());
+        assert!(loaded.pending_fast_path.is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(history_path(&path));
     }
@@ -264,6 +331,7 @@ mod tests {
         assert_eq!(loaded.peer, "1.1.1.1:443");
         assert!(loaded.recent.is_empty());
         assert!(loaded.failed.is_empty());
+        assert!(loaded.pending_fast_path.is_empty());
         assert_eq!(recent_peers(&loaded), vec!["1.1.1.1:443".parse().unwrap()]);
         let _ = std::fs::remove_file(&path);
     }
@@ -281,7 +349,7 @@ mod tests {
                 last_failure_ms: 1_000,
                 cooldown_until_ms: 10_000,
             }],
-            source_path: String::new(),
+            ..Default::default()
         };
         assert_eq!(
             recent_peers_at(&cached, 5_000),
@@ -312,6 +380,49 @@ mod tests {
         save(&path, &peer.to_string(), "gfw");
         let recovered = load(&path).unwrap();
         assert!(recovered.failed.is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(history_path(&path));
+    }
+
+    #[test]
+    fn pending_fast_path_marks_only_failed_prefix_before_cached_winner() {
+        let path = tmp_path("pending-prefix");
+        save(&path, "1.1.1.1:443", "firewall");
+        save(&path, "1.0.0.1:443", "firewall");
+        save(&path, "9.9.9.9:443", "firewall");
+
+        let mut cached = load(&path).unwrap();
+        cached.pending_fast_path = vec![
+            "9.9.9.9:443".into(),
+            "1.0.0.1:443".into(),
+            "1.1.1.1:443".into(),
+        ];
+        cached.pending_fast_path_ms = 1;
+        persist(&path, &cached);
+
+        save(&path, "1.0.0.1:443", "firewall");
+        let resolved = load(&path).unwrap();
+        assert_eq!(resolved.failed.len(), 1);
+        assert_eq!(resolved.failed[0].peer, "9.9.9.9:443");
+        assert!(resolved.pending_fast_path.is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(history_path(&path));
+    }
+
+    #[test]
+    fn pending_fast_path_marks_all_cached_candidates_when_fresh_scan_wins() {
+        let path = tmp_path("pending-fresh");
+        save(&path, "1.1.1.1:443", "firewall");
+        let mut cached = load(&path).unwrap();
+        cached.pending_fast_path = vec!["1.1.1.1:443".into(), "1.0.0.1:443".into()];
+        cached.pending_fast_path_ms = 1;
+        persist(&path, &cached);
+
+        save(&path, "8.8.8.8:443", "firewall");
+        let resolved = load(&path).unwrap();
+        assert_eq!(resolved.failed.len(), 2);
+        assert!(resolved.failed.iter().any(|entry| entry.peer == "1.1.1.1:443"));
+        assert!(resolved.failed.iter().any(|entry| entry.peer == "1.0.0.1:443"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(history_path(&path));
     }

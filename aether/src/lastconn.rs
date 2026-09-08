@@ -52,6 +52,18 @@ fn history_path(path: &str) -> String {
     format!("{path}.history")
 }
 
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn active_transport() -> PathTransport {
     match std::env::var("AETHER_PROTOCOL")
         .unwrap_or_else(|_| "masque".to_string())
@@ -61,7 +73,7 @@ fn active_transport() -> PathTransport {
     {
         "wg" | "wireguard" => PathTransport::WireGuard,
         "gool" | "wiw" | "warp-in-warp" | "warpinwarp" => PathTransport::Gool,
-        _ if std::env::var("AETHER_MASQUE_HTTP2").is_ok() => PathTransport::MasqueH2,
+        _ if env_truthy("AETHER_MASQUE_HTTP2") => PathTransport::MasqueH2,
         _ => PathTransport::MasqueH3,
     }
 }
@@ -316,5 +328,16 @@ mod tests {
         std::env::remove_var("AETHER_NETWORK_KEY");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(history_path(&path));
+    }
+
+    #[test]
+    fn zero_value_http2_env_stays_on_h3() {
+        std::env::set_var("AETHER_PROTOCOL", "masque");
+        std::env::set_var("AETHER_MASQUE_HTTP2", "0");
+        assert_eq!(active_transport(), PathTransport::MasqueH3);
+        std::env::set_var("AETHER_MASQUE_HTTP2", "1");
+        assert_eq!(active_transport(), PathTransport::MasqueH2);
+        std::env::remove_var("AETHER_PROTOCOL");
+        std::env::remove_var("AETHER_MASQUE_HTTP2");
     }
 }

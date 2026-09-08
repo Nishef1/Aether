@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
-use boring::ssl::{SslConnector, SslMethod, SslVersion};
+use boring::ssl::{SslConnector, SslMethod};
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
@@ -19,7 +19,6 @@ use crate::quic::{AssignedAddr, Control, Internals};
 use crate::tls;
 
 const H2_ALPN: &[u8] = b"\x02h2";
-const CHROME_GROUPS: &str = "P-256:X25519:P-384";
 
 const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
 const H2_SEND_BATCH_BYTES: usize = 32 * 1024;
@@ -124,24 +123,7 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    builder
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-    builder
-        .set_max_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-
-    builder.set_grease_enabled(true);
-
-    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
-    let groups = groups
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(CHROME_GROUPS);
-    builder
-        .set_curves_list(groups)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    tls::apply_client_profile(&mut *builder, tls::TlsCarrier::H2)?;
 
     builder
         .set_alpn_protos(H2_ALPN)

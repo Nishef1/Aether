@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "path_history.rs"]
+mod path_history;
+use path_history::PathTransport;
 
 /// How many recently-working endpoints are remembered for the fast path.
 pub const RECENT_CAP: usize = 8;
@@ -31,6 +36,9 @@ pub struct LastConnection {
     /// small and additive so old lastconn files continue to deserialize.
     #[serde(default)]
     pub failed: Vec<FailedEndpoint>,
+    /// Runtime-only origin used to find the matching PathHistory file.
+    #[serde(skip)]
+    source_path: String,
 }
 
 fn now_ms() -> u64 {
@@ -40,9 +48,29 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn history_path(path: &str) -> String {
+    format!("{path}.history")
+}
+
+fn active_transport() -> PathTransport {
+    match std::env::var("AETHER_PROTOCOL")
+        .unwrap_or_else(|_| "masque".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "wg" | "wireguard" => PathTransport::WireGuard,
+        "gool" | "wiw" | "warp-in-warp" | "warpinwarp" => PathTransport::Gool,
+        _ if std::env::var("AETHER_MASQUE_HTTP2").is_ok() => PathTransport::MasqueH2,
+        _ => PathTransport::MasqueH3,
+    }
+}
+
 pub fn load(path: &str) -> Option<LastConnection> {
     let text = std::fs::read_to_string(path).ok()?;
-    toml::from_str(&text).ok()
+    let mut conn: LastConnection = toml::from_str(&text).ok()?;
+    conn.source_path = path.to_string();
+    Some(conn)
 }
 
 fn persist(path: &str, conn: &LastConnection) {
@@ -56,8 +84,34 @@ fn persist(path: &str, conn: &LastConnection) {
     }
 }
 
+fn record_history_success(path: &str, peer: &str, profile: &str) {
+    let Ok(peer) = peer.parse::<SocketAddr>() else {
+        return;
+    };
+    path_history::record_success_file(
+        &history_path(path),
+        &path_history::network_key_from_env(),
+        peer,
+        active_transport(),
+        profile,
+        None,
+        None,
+    );
+}
+
+fn record_history_failure(path: &str, peer: SocketAddr, profile: &str) {
+    path_history::record_failure_file(
+        &history_path(path),
+        &path_history::network_key_from_env(),
+        peer,
+        active_transport(),
+        profile,
+    );
+}
+
 pub fn save(path: &str, peer: &str, profile: &str) {
     let mut conn = load(path).unwrap_or_default();
+    conn.source_path = path.to_string();
     conn.peer = peer.to_string();
     conn.profile = profile.to_string();
     conn.recent.retain(|p| p != peer);
@@ -68,23 +122,26 @@ pub fn save(path: &str, peer: &str, profile: &str) {
         .sort_by_key(|entry| std::cmp::Reverse(entry.last_failure_ms));
     conn.failed.truncate(FAILURE_CAP);
     persist(path, &conn);
+    record_history_success(path, peer, profile);
 }
 
 /// Record a failed fast-path verification and persist a bounded exponential
 /// cooldown. Fresh scans are still allowed to rediscover the endpoint later.
 pub fn record_failure(path: &str, peer: SocketAddr) {
     let mut conn = load(path).unwrap_or_default();
-    let peer = peer.to_string();
+    conn.source_path = path.to_string();
+    let peer_text = peer.to_string();
     let now = now_ms();
 
-    if let Some(entry) = conn.failed.iter_mut().find(|entry| entry.peer == peer) {
+    if let Some(entry) = conn.failed.iter_mut().find(|entry| entry.peer == peer_text) {
         entry.failures = entry.failures.saturating_add(1);
         entry.last_failure_ms = now;
-        let index = (entry.failures.saturating_sub(1) as usize).min(FAILURE_COOLDOWN_SECS.len() - 1);
+        let index =
+            (entry.failures.saturating_sub(1) as usize).min(FAILURE_COOLDOWN_SECS.len() - 1);
         entry.cooldown_until_ms = now.saturating_add(FAILURE_COOLDOWN_SECS[index] * 1000);
     } else {
         conn.failed.push(FailedEndpoint {
-            peer,
+            peer: peer_text,
             failures: 1,
             last_failure_ms: now,
             cooldown_until_ms: now.saturating_add(FAILURE_COOLDOWN_SECS[0] * 1000),
@@ -94,7 +151,9 @@ pub fn record_failure(path: &str, peer: SocketAddr) {
     conn.failed
         .sort_by_key(|entry| std::cmp::Reverse(entry.last_failure_ms));
     conn.failed.truncate(FAILURE_CAP);
+    let profile = conn.profile.clone();
     persist(path, &conn);
+    record_history_failure(path, peer, &profile);
 }
 
 fn is_cooled(cached: &LastConnection, peer: SocketAddr, now: u64) -> bool {
@@ -106,16 +165,16 @@ fn is_cooled(cached: &LastConnection, peer: SocketAddr, now: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Parsed, most-recent-first candidates for the reconnect fast path. Peers in
-/// an active persisted cooldown are skipped, but remain eligible for a later
-/// full scan after the cooldown expires.
+/// Parsed candidates for the reconnect fast path. Active cooldowns are removed,
+/// then paths observed on this network are ordered by persistent quality/history;
+/// unseen peers retain their original recent-first order.
 pub fn recent_peers(cached: &LastConnection) -> Vec<SocketAddr> {
     recent_peers_at(cached, now_ms())
 }
 
 fn recent_peers_at(cached: &LastConnection, now: u64) -> Vec<SocketAddr> {
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for raw in std::iter::once(&cached.peer).chain(cached.recent.iter()) {
         if let Ok(addr) = raw.parse::<SocketAddr>() {
             if seen.insert(addr) && !is_cooled(cached, addr, now) {
@@ -123,6 +182,26 @@ fn recent_peers_at(cached: &LastConnection, now: u64) -> Vec<SocketAddr> {
             }
         }
     }
+
+    if cached.source_path.is_empty() {
+        return out;
+    }
+
+    let history = path_history::load(&history_path(&cached.source_path));
+    if history.network_key != path_history::network_key_from_env() {
+        return out;
+    }
+
+    let transport = active_transport();
+    let order: HashMap<SocketAddr, usize> = history
+        .rank()
+        .into_iter()
+        .filter(|path| path.transport == transport)
+        .enumerate()
+        .map(|(index, path)| (path.peer, index))
+        .collect();
+
+    out.sort_by_key(|peer| order.get(peer).copied().unwrap_or(usize::MAX));
     out
 }
 
@@ -134,6 +213,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("aether-lastconn-test-{tag}-{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(format!("{}.history", p.to_string_lossy()));
         p.to_string_lossy().to_string()
     }
 
@@ -148,6 +228,7 @@ mod tests {
         assert_eq!(loaded.recent, vec!["1.1.1.1:443", "1.0.0.1:443"]);
         assert!(loaded.failed.is_empty());
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(history_path(&path));
     }
 
     #[test]
@@ -160,6 +241,7 @@ mod tests {
         assert_eq!(loaded.recent.len(), RECENT_CAP);
         assert_eq!(loaded.recent[0], "10.0.0.19:443");
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(history_path(&path));
     }
 
     #[test]
@@ -187,6 +269,7 @@ mod tests {
                 last_failure_ms: 1_000,
                 cooldown_until_ms: 10_000,
             }],
+            source_path: String::new(),
         };
         assert_eq!(
             recent_peers_at(&cached, 5_000),
@@ -218,5 +301,20 @@ mod tests {
         let recovered = load(&path).unwrap();
         assert!(recovered.failed.is_empty());
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(history_path(&path));
+    }
+
+    #[test]
+    fn save_records_history_for_the_current_network() {
+        let path = tmp_path("history");
+        std::env::set_var("AETHER_NETWORK_KEY", "test-network");
+        save(&path, "1.1.1.1:443", "firewall");
+        let history = path_history::load(&history_path(&path));
+        assert_eq!(history.network_key, "test-network");
+        assert_eq!(history.paths.len(), 1);
+        assert_eq!(history.paths[0].successes, 1);
+        std::env::remove_var("AETHER_NETWORK_KEY");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(history_path(&path));
     }
 }

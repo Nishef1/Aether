@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -331,38 +331,58 @@ async fn dns_exchange(
     let mut last = AetherError::Other("dns timeout".into());
 
     for server in resolver_addresses() {
-        let (query, id) = build_dns_query(name, QTYPE_A);
-        if let Err(error) = sender.send_to(server, query).await {
-            last = error;
-            continue;
-        }
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-
-        loop {
-            let resp = match tokio::time::timeout_at(deadline, from_stack.recv()).await {
-                Ok(Some(resp)) => resp,
-                Ok(None) => return Err(AetherError::Other("dns channel closed".into())),
-                Err(_) => {
-                    last = AetherError::Other(format!("dns timeout from {server}"));
-                    break;
+        match dns_query_server(sender, from_stack, server, name, QTYPE_A).await {
+            Ok(Some(ip)) => return Ok(ip),
+            Ok(None) => {
+                // A valid NODATA response proves this resolver is reachable.
+                // Only then try AAAA, preserving IPv4-first behaviour without
+                // doubling timeout cost on networks where DNS itself is broken.
+                match dns_query_server(sender, from_stack, server, name, QTYPE_AAAA).await {
+                    Ok(Some(ip)) => return Ok(ip),
+                    Ok(None) => {
+                        last = AetherError::Other(format!("no A or AAAA record for {name}"));
+                    }
+                    Err(error) => last = error,
                 }
-            };
-
-            if !dns_response_matches(&resp.1, id, name, QTYPE_A) {
-                continue;
             }
-            if let Some(ip) = parse_dns_a(&resp.1) {
-                return Ok(ip);
-            }
-            return Err(AetherError::Other(format!("no A record for {name}")));
+            Err(error) => last = error,
         }
     }
 
     Err(last)
 }
 
+async fn dns_query_server(
+    sender: &UdpSender,
+    from_stack: &mut mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    server: SocketAddr,
+    name: &str,
+    qtype: u16,
+) -> Result<Option<IpAddr>> {
+    let (query, id) = build_dns_query(name, qtype);
+    sender.send_to(server, query).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+    loop {
+        let resp = match tokio::time::timeout_at(deadline, from_stack.recv()).await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return Err(AetherError::Other("dns channel closed".into())),
+            Err(_) => {
+                return Err(AetherError::Other(format!(
+                    "dns timeout from {server} for type {qtype}"
+                )))
+            }
+        };
+
+        if resp.0 != server || !dns_response_matches(&resp.1, id, name, qtype) {
+            continue;
+        }
+        return Ok(parse_dns_answer(&resp.1, qtype));
+    }
+}
+
 const QTYPE_A: u16 = 1;
+const QTYPE_AAAA: u16 = 28;
 
 fn build_dns_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     let mut q = Vec::with_capacity(32 + name.len());
@@ -434,7 +454,7 @@ pub(crate) fn dns_response_matches(
     u16::from_be_bytes([resp[pos], resp[pos + 1]]) == expected_qtype
 }
 
-fn parse_dns_a(resp: &[u8]) -> Option<IpAddr> {
+fn parse_dns_answer(resp: &[u8], qtype: u16) -> Option<IpAddr> {
     if resp.len() < 12 {
         return None;
     }
@@ -458,13 +478,23 @@ fn parse_dns_a(resp: &[u8]) -> Option<IpAddr> {
         if pos + rdlen > resp.len() {
             return None;
         }
-        if rtype == 1 && rdlen == 4 {
-            return Some(IpAddr::V4(Ipv4Addr::new(
-                resp[pos],
-                resp[pos + 1],
-                resp[pos + 2],
-                resp[pos + 3],
-            )));
+        if rtype == qtype {
+            match (qtype, rdlen) {
+                (QTYPE_A, 4) => {
+                    return Some(IpAddr::V4(Ipv4Addr::new(
+                        resp[pos],
+                        resp[pos + 1],
+                        resp[pos + 2],
+                        resp[pos + 3],
+                    )))
+                }
+                (QTYPE_AAAA, 16) => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&resp[pos..pos + 16]);
+                    return Some(IpAddr::V6(Ipv6Addr::from(octets)));
+                }
+                _ => {}
+            }
         }
         pos += rdlen;
     }
@@ -822,7 +852,6 @@ async fn open_through_gateway(
         }
     }
 }
-
 
 async fn handle_udp_associate(
     mut sock: TcpStream,
@@ -1249,10 +1278,40 @@ mod tests {
         msg
     }
 
+    fn answer(id: u16, name: &str, qtype: u16, rdata: &[u8]) -> Vec<u8> {
+        let mut msg = reply(id, name, qtype, true);
+        msg.extend_from_slice(&[0xc0, 0x0c]);
+        msg.extend_from_slice(&qtype.to_be_bytes());
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        msg.extend_from_slice(&60u32.to_be_bytes());
+        msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        msg.extend_from_slice(rdata);
+        msg
+    }
+
     #[test]
     fn build_dns_query_reports_the_id_it_wrote() {
         let (query, id) = build_dns_query("example.com", QTYPE_A);
         assert_eq!(u16::from_be_bytes([query[0], query[1]]), id);
+    }
+
+    #[test]
+    fn build_dns_query_supports_aaaa_without_changing_the_a_default() {
+        let (query, _) = build_dns_query("example.com", QTYPE_AAAA);
+        assert_eq!(&query[query.len() - 4..query.len() - 2], &QTYPE_AAAA.to_be_bytes());
+    }
+
+    #[test]
+    fn parses_a_and_aaaa_answers() {
+        let a = answer(0x4242, "example.com", QTYPE_A, &[203, 0, 113, 7]);
+        assert_eq!(
+            parse_dns_answer(&a, QTYPE_A),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+        );
+
+        let v6: Ipv6Addr = "2001:db8::7".parse().unwrap();
+        let aaaa = answer(0x4242, "example.com", QTYPE_AAAA, &v6.octets());
+        assert_eq!(parse_dns_answer(&aaaa, QTYPE_AAAA), Some(IpAddr::V6(v6)));
     }
 
     #[test]

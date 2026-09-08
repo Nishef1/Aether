@@ -64,7 +64,10 @@ impl PathObservation {
             .jitter_ms
             .map(|jitter| (jitter as f32 / 500.0).min(1.0))
             .unwrap_or(0.0);
-        let quality = self.quality_score.map(|value| value as f32 / 100.0).unwrap_or(0.5);
+        let quality = self
+            .quality_score
+            .map(|value| value as f32 / 100.0)
+            .unwrap_or(0.5);
 
         (self.reliability() * 0.38
             + self.confidence() * 0.18
@@ -167,6 +170,85 @@ impl PathHistory {
     }
 }
 
+pub fn load(path: &str) -> PathHistory {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<PathHistory>(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save(path: &str, history: &PathHistory) {
+    let Ok(text) = toml::to_string_pretty(history) else {
+        log::debug!("[path-history] failed to encode {path}");
+        return;
+    };
+
+    let tmp = format!("{path}.tmp");
+    if let Err(error) = std::fs::write(&tmp, text) {
+        log::debug!("[path-history] failed to write {tmp}: {error}");
+        return;
+    }
+
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        // Windows cannot replace an existing file with rename. Falling back to
+        // a direct write keeps this optional optimization from blocking startup.
+        if let Ok(text) = toml::to_string_pretty(history) {
+            if let Err(write_error) = std::fs::write(path, text) {
+                log::debug!(
+                    "[path-history] failed to replace {path}: {error}; direct write also failed: {write_error}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+pub fn record_success_file(
+    path: &str,
+    network_key: &str,
+    peer: SocketAddr,
+    transport: PathTransport,
+    profile: &str,
+    rtt_ms: Option<u32>,
+    quality_score: Option<u8>,
+) {
+    let mut history = load(path);
+    if history.network_key != network_key {
+        history = PathHistory {
+            network_key: network_key.to_string(),
+            paths: Vec::new(),
+        };
+    }
+    history.record_success(peer, transport, profile, rtt_ms, quality_score);
+    save(path, &history);
+}
+
+pub fn record_failure_file(
+    path: &str,
+    network_key: &str,
+    peer: SocketAddr,
+    transport: PathTransport,
+    profile: &str,
+) {
+    let mut history = load(path);
+    if history.network_key != network_key {
+        history = PathHistory {
+            network_key: network_key.to_string(),
+            paths: Vec::new(),
+        };
+    }
+    history.record_failure(peer, transport, profile);
+    save(path, &history);
+}
+
+pub fn network_key_from_env() -> String {
+    std::env::var("AETHER_NETWORK_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -177,6 +259,13 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_path(tag: &str) -> String {
+        let mut path = std::env::temp_dir();
+        path.push(format!("aether-path-history-{tag}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().to_string()
+    }
 
     #[test]
     fn reliable_fresh_path_beats_failed_path() {
@@ -234,5 +323,34 @@ mod tests {
         assert_eq!(history.paths.len(), 1);
         assert_eq!(history.paths[0].successes, 1);
         assert_eq!(history.paths[0].failures, 1);
+    }
+
+    #[test]
+    fn file_helpers_reset_when_network_context_changes() {
+        let path = tmp_path("network");
+        let peer: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        record_success_file(
+            &path,
+            "wifi-a",
+            peer,
+            PathTransport::MasqueH3,
+            "firewall",
+            Some(100),
+            Some(90),
+        );
+        assert_eq!(load(&path).paths.len(), 1);
+        record_failure_file(
+            &path,
+            "wifi-b",
+            peer,
+            PathTransport::MasqueH3,
+            "firewall",
+        );
+        let reloaded = load(&path);
+        assert_eq!(reloaded.network_key, "wifi-b");
+        assert_eq!(reloaded.paths.len(), 1);
+        assert_eq!(reloaded.paths[0].successes, 0);
+        assert_eq!(reloaded.paths[0].failures, 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

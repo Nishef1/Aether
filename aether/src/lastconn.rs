@@ -29,6 +29,11 @@ pub struct LastConnection {
     pub peer: String,
     #[serde(default)]
     pub profile: String,
+    /// Underlay fingerprint that owns every positive/negative observation in
+    /// this file. Legacy files leave it blank and are intentionally not replayed
+    /// until a new success scopes them to the current network.
+    #[serde(default)]
+    pub network_key: String,
     /// Most-recent-first ring of working `ip:port`s. Old files simply lack
     /// it and load as empty, so this stays backward compatible.
     #[serde(default)]
@@ -104,6 +109,21 @@ fn persist(path: &str, conn: &LastConnection) {
     }
 }
 
+fn scoped_connection(path: &str) -> LastConnection {
+    let network_key = path_history::network_key_from_env();
+    let mut conn = load(path).unwrap_or_default();
+    if conn.network_key != network_key {
+        conn = LastConnection {
+            network_key,
+            source_path: path.to_string(),
+            ..Default::default()
+        };
+    } else {
+        conn.source_path = path.to_string();
+    }
+    conn
+}
+
 fn record_history_success(path: &str, peer: &str, profile: &str) {
     let Ok(peer) = peer.parse::<SocketAddr>() else {
         return;
@@ -176,8 +196,7 @@ fn resolve_pending_fast_path(conn: &mut LastConnection, winner: &str, now: u64) 
 }
 
 pub fn save(path: &str, peer: &str, profile: &str) {
-    let mut conn = load(path).unwrap_or_default();
-    conn.source_path = path.to_string();
+    let mut conn = scoped_connection(path);
     let now = now_ms();
     let previous_profile = conn.profile.clone();
     let failed_fast_path = resolve_pending_fast_path(&mut conn, peer, now);
@@ -208,8 +227,7 @@ pub fn save(path: &str, peer: &str, profile: &str) {
 /// Record a failed fast-path verification and persist a bounded exponential
 /// cooldown. Fresh scans are still allowed to rediscover the endpoint later.
 pub fn record_failure(path: &str, peer: SocketAddr) {
-    let mut conn = load(path).unwrap_or_default();
-    conn.source_path = path.to_string();
+    let mut conn = scoped_connection(path);
     let now = now_ms();
     apply_failure(&mut conn, peer, now);
 
@@ -228,6 +246,46 @@ fn is_cooled(cached: &LastConnection, peer: SocketAddr, now: u64) -> bool {
         .find(|entry| entry.peer == peer.to_string())
         .map(|entry| entry.cooldown_until_ms > now)
         .unwrap_or(false)
+}
+
+fn diversity_bucket(peer: SocketAddr) -> String {
+    match peer.ip() {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            format!("v4:{:02x}{:02x}{:02x}", octets[0], octets[1], octets[2])
+        }
+        std::net::IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            format!(
+                "v6:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                octets[0], octets[1], octets[2], octets[3], octets[4], octets[5]
+            )
+        }
+    }
+}
+
+/// Preserve the strongest winner at index zero, then prefer different /24
+/// (IPv4) or /48 (IPv6) failure domains before retrying another peer from the
+/// same bucket. No candidate is dropped and score order is preserved within
+/// each pass.
+fn diversify_ranked(peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut iter = peers.into_iter();
+    let Some(first) = iter.next() else {
+        return Vec::new();
+    };
+
+    let mut out = vec![first];
+    let mut seen_buckets = HashSet::from([diversity_bucket(first)]);
+    let mut deferred = Vec::new();
+    for peer in iter {
+        if seen_buckets.insert(diversity_bucket(peer)) {
+            out.push(peer);
+        } else {
+            deferred.push(peer);
+        }
+    }
+    out.extend(deferred);
+    out
 }
 
 /// Parsed candidates for the reconnect fast path. Active cooldowns are removed,
@@ -259,6 +317,11 @@ pub fn recent_peers(cached: &LastConnection) -> Vec<SocketAddr> {
 }
 
 fn recent_peers_at(cached: &LastConnection, now: u64) -> Vec<SocketAddr> {
+    let current_network = path_history::network_key_from_env();
+    if !cached.source_path.is_empty() && cached.network_key != current_network {
+        return Vec::new();
+    }
+
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for raw in std::iter::once(&cached.peer).chain(cached.recent.iter()) {
@@ -270,12 +333,12 @@ fn recent_peers_at(cached: &LastConnection, now: u64) -> Vec<SocketAddr> {
     }
 
     if cached.source_path.is_empty() {
-        return out;
+        return diversify_ranked(out);
     }
 
     let history = path_history::load(&history_path(&cached.source_path));
-    if history.network_key != path_history::network_key_from_env() {
-        return out;
+    if history.network_key != current_network {
+        return diversify_ranked(out);
     }
 
     let transport = active_transport();
@@ -288,7 +351,7 @@ fn recent_peers_at(cached: &LastConnection, now: u64) -> Vec<SocketAddr> {
         .collect();
 
     out.sort_by_key(|peer| order.get(peer).copied().unwrap_or(usize::MAX));
-    out
+    diversify_ranked(out)
 }
 
 #[cfg(test)]
@@ -312,6 +375,7 @@ mod tests {
         let loaded = load(&path).expect("saved file must load");
         assert_eq!(loaded.peer, "1.1.1.1:443", "peer stays the latest");
         assert_eq!(loaded.recent, vec!["1.1.1.1:443", "1.0.0.1:443"]);
+        assert!(!loaded.network_key.is_empty());
         assert!(loaded.failed.is_empty());
         assert!(loaded.pending_fast_path.is_empty());
         let _ = std::fs::remove_file(&path);
@@ -332,15 +396,16 @@ mod tests {
     }
 
     #[test]
-    fn old_files_without_recent_or_failed_still_load() {
+    fn old_files_load_but_are_not_replayed_across_unknown_networks() {
         let path = tmp_path("legacy");
         std::fs::write(&path, "peer = \"1.1.1.1:443\"\nprofile = \"gfw\"\n").unwrap();
         let loaded = load(&path).expect("legacy file must load");
         assert_eq!(loaded.peer, "1.1.1.1:443");
+        assert!(loaded.network_key.is_empty());
         assert!(loaded.recent.is_empty());
         assert!(loaded.failed.is_empty());
         assert!(loaded.pending_fast_path.is_empty());
-        assert_eq!(recent_peers(&loaded), vec!["1.1.1.1:443".parse().unwrap()]);
+        assert!(recent_peers(&loaded).is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -367,6 +432,27 @@ mod tests {
             recent_peers_at(&cached, 10_001),
             vec![peer, "1.0.0.1:443".parse().unwrap()]
         );
+    }
+
+    #[test]
+    fn rescue_order_prefers_distinct_failure_domains_without_dropping_peers() {
+        let peers: Vec<SocketAddr> = [
+            "10.0.0.1:443",
+            "10.0.0.2:443",
+            "10.0.1.1:443",
+            "[2606:4700:4700::1]:443",
+            "10.0.0.3:443",
+        ]
+        .into_iter()
+        .map(|value| value.parse().unwrap())
+        .collect();
+        let diversified = diversify_ranked(peers.clone());
+        assert_eq!(diversified[0], peers[0], "best winner must stay first");
+        assert_eq!(diversified.len(), peers.len());
+        assert_eq!(diversified[1], peers[2]);
+        assert_eq!(diversified[2], peers[3]);
+        assert!(diversified[3..].contains(&peers[1]));
+        assert!(diversified[3..].contains(&peers[4]));
     }
 
     #[test]
@@ -461,6 +547,8 @@ mod tests {
         assert_eq!(history.network_key, "test-network");
         assert_eq!(history.paths.len(), 1);
         assert_eq!(history.paths[0].successes, 1);
+        let last = load(&path).unwrap();
+        assert_eq!(last.network_key, "test-network");
         std::env::remove_var("AETHER_NETWORK_KEY");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(history_path(&path));

@@ -11,6 +11,7 @@ use path_history::PathTransport;
 pub const RECENT_CAP: usize = 8;
 const FAILURE_CAP: usize = 16;
 const FAILURE_COOLDOWN_SECS: [u64; 4] = [30, 120, 300, 600];
+const PENDING_FAST_PATH_TTL_MS: u64 = 15 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FailedEndpoint {
@@ -148,8 +149,11 @@ fn apply_failure(conn: &mut LastConnection, peer: SocketAddr, now: u64) {
 
 fn resolve_pending_fast_path(conn: &mut LastConnection, winner: &str, now: u64) -> Vec<SocketAddr> {
     let pending = std::mem::take(&mut conn.pending_fast_path);
-    conn.pending_fast_path_ms = 0;
-    if pending.is_empty() {
+    let pending_at = std::mem::take(&mut conn.pending_fast_path_ms);
+    if pending.is_empty()
+        || pending_at == 0
+        || now.saturating_sub(pending_at) > PENDING_FAST_PATH_TTL_MS
+    {
         return Vec::new();
     }
 
@@ -233,18 +237,22 @@ pub fn recent_peers(cached: &LastConnection) -> Vec<SocketAddr> {
     let now = now_ms();
     let out = recent_peers_at(cached, now);
 
-    // The GUI supplies an explicit quick-reconnect flag. Record the ordered
-    // offer only in that non-interactive case; interactive users who decline
-    // reconnect must not create false failures. The eventual save resolves the
-    // prefix that was actually attempted before a winner was found.
-    if env_truthy("AETHER_QUICK_RECONNECT")
-        && !cached.source_path.is_empty()
-        && !out.is_empty()
-    {
+    if !cached.source_path.is_empty() {
         let mut pending = cached.clone();
-        pending.pending_fast_path = out.iter().map(ToString::to_string).collect();
-        pending.pending_fast_path_ms = now;
-        persist(&cached.source_path, &pending);
+        if env_truthy("AETHER_QUICK_RECONNECT") && !out.is_empty() {
+            // Explicit non-interactive quick reconnect: remember exactly what
+            // the verifier is about to try, in order.
+            pending.pending_fast_path = out.iter().map(ToString::to_string).collect();
+            pending.pending_fast_path_ms = now;
+            persist(&cached.source_path, &pending);
+        } else if !pending.pending_fast_path.is_empty() || pending.pending_fast_path_ms != 0 {
+            // A later fresh/interactive connection proves any older in-flight
+            // attempt was abandoned. Clear it before a future save can mistake
+            // cancellation for failed network evidence.
+            pending.pending_fast_path.clear();
+            pending.pending_fast_path_ms = 0;
+            persist(&cached.source_path, &pending);
+        }
     }
 
     out
@@ -397,7 +405,7 @@ mod tests {
             "1.0.0.1:443".into(),
             "1.1.1.1:443".into(),
         ];
-        cached.pending_fast_path_ms = 1;
+        cached.pending_fast_path_ms = now_ms();
         persist(&path, &cached);
 
         save(&path, "1.0.0.1:443", "firewall");
@@ -415,7 +423,7 @@ mod tests {
         save(&path, "1.1.1.1:443", "firewall");
         let mut cached = load(&path).unwrap();
         cached.pending_fast_path = vec!["1.1.1.1:443".into(), "1.0.0.1:443".into()];
-        cached.pending_fast_path_ms = 1;
+        cached.pending_fast_path_ms = now_ms();
         persist(&path, &cached);
 
         save(&path, "8.8.8.8:443", "firewall");
@@ -425,6 +433,23 @@ mod tests {
         assert!(resolved.failed.iter().any(|entry| entry.peer == "1.0.0.1:443"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(history_path(&path));
+    }
+
+    #[test]
+    fn abandoned_pending_fast_path_expires_without_false_failures() {
+        let mut cached = LastConnection {
+            pending_fast_path: vec!["1.1.1.1:443".into()],
+            pending_fast_path_ms: 1_000,
+            ..Default::default()
+        };
+        let failed = resolve_pending_fast_path(
+            &mut cached,
+            "8.8.8.8:443",
+            1_000 + PENDING_FAST_PATH_TTL_MS + 1,
+        );
+        assert!(failed.is_empty());
+        assert!(cached.pending_fast_path.is_empty());
+        assert_eq!(cached.pending_fast_path_ms, 0);
     }
 
     #[test]

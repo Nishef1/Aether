@@ -28,6 +28,7 @@ extern "C" {
 const CURRENT_GROUPS: &str = "P-256:X25519:P-384";
 const MINIMAL_GROUPS: &str = "X25519:P-256";
 const EXPERIMENTAL_GROUPS: &str = "X25519:P-256:P-384";
+const PROFILE_GROUPS_PREFIX: &str = "@profile=";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlsCarrier {
@@ -45,19 +46,21 @@ pub enum TlsProfile {
 }
 
 impl TlsProfile {
-    fn from_env() -> Self {
-        match std::env::var("AETHER_TLS_PROFILE")
-            .unwrap_or_else(|_| "automatic".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
             "current" | "boringssl" | "current-boringssl" => Self::Current,
             "native-minimal" | "minimal" | "native" => Self::NativeMinimal,
             "compatibility" | "compat" => Self::Compatibility,
             "experimental" | "experiment" => Self::Experimental,
             _ => Self::Automatic,
         }
+    }
+
+    fn from_env() -> Self {
+        std::env::var("AETHER_TLS_PROFILE")
+            .ok()
+            .map(|value| Self::parse(&value))
+            .unwrap_or(Self::Automatic)
     }
 
     fn label(self) -> &'static str {
@@ -105,8 +108,31 @@ fn policy_for(profile: TlsProfile, carrier: TlsCarrier) -> TlsPolicy {
     }
 }
 
+fn parse_groups_bridge(raw: &str) -> (Option<TlsProfile>, Option<&str>) {
+    let value = raw.trim();
+    let Some(rest) = value.strip_prefix(PROFILE_GROUPS_PREFIX) else {
+        return (None, (!value.is_empty()).then_some(value));
+    };
+
+    let (profile, groups) = rest
+        .split_once(";groups=")
+        .map(|(profile, groups)| (profile, Some(groups.trim())))
+        .unwrap_or((rest, None));
+    let groups = groups.filter(|groups| !groups.is_empty());
+    (Some(TlsProfile::parse(profile)), groups)
+}
+
 pub fn apply_client_profile(builder: &mut SslContextBuilder, carrier: TlsCarrier) -> Result<()> {
-    let profile = TlsProfile::from_env();
+    let raw_groups = std::env::var("AETHER_TLS_GROUPS").ok();
+    let (bridged_profile, bridged_groups) = raw_groups
+        .as_deref()
+        .map(parse_groups_bridge)
+        .unwrap_or((None, None));
+    let profile = std::env::var("AETHER_TLS_PROFILE")
+        .ok()
+        .map(|value| TlsProfile::parse(&value))
+        .or(bridged_profile)
+        .unwrap_or_else(TlsProfile::from_env);
     let policy = policy_for(profile, carrier);
 
     builder
@@ -121,12 +147,16 @@ pub fn apply_client_profile(builder: &mut SslContextBuilder, carrier: TlsCarrier
         .map_err(|e| AetherError::Tls(e.to_string()))?;
     builder.set_grease_enabled(policy.grease);
 
-    // Manual groups remain an expert override above the named profile.
-    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
-    let groups = groups
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    // Manual groups remain an expert override above the named profile. Android
+    // can carry both through the existing --tls-groups bridge without widening
+    // the Kotlin process contract.
+    let groups = bridged_groups
+        .or_else(|| {
+            raw_groups
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.starts_with(PROFILE_GROUPS_PREFIX))
+        })
         .unwrap_or(policy.groups);
     builder
         .set_curves_list(groups)
@@ -371,5 +401,21 @@ mod tests {
         assert!(policy.tls13_only);
         assert!(policy.grease);
         assert_eq!(policy.groups, EXPERIMENTAL_GROUPS);
+    }
+
+    #[test]
+    fn android_groups_bridge_keeps_named_profile_and_manual_groups_separate() {
+        let (profile, groups) = parse_groups_bridge(
+            "@profile=native-minimal;groups=X25519:P-256",
+        );
+        assert_eq!(profile, Some(TlsProfile::NativeMinimal));
+        assert_eq!(groups, Some("X25519:P-256"));
+    }
+
+    #[test]
+    fn plain_groups_remain_a_manual_override() {
+        let (profile, groups) = parse_groups_bridge("P-256:X25519");
+        assert_eq!(profile, None);
+        assert_eq!(groups, Some("P-256:X25519"));
     }
 }

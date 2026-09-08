@@ -11,6 +11,7 @@ pub const CAPSULE_ADDRESS_ASSIGN: u64 = 0x01;
 pub const CAPSULE_ADDRESS_REQUEST: u64 = 0x02;
 pub const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
 pub const CAPSULE_DATAGRAM: u64 = 0x00;
+const PROBE_RESOLVER: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 
 #[derive(Debug, Clone)]
 pub struct AssignedAddress {
@@ -35,6 +36,14 @@ pub enum Capsule {
     Datagram(Vec<u8>),
     RouteAdvertisement(Vec<RouteAdvertisement>),
     Unknown { kind: u64, payload: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsProbe {
+    pub packet: Vec<u8>,
+    pub source_ip: Ipv4Addr,
+    pub source_port: u16,
+    pub transaction_id: u16,
 }
 
 pub fn connect_ip_request(authority: &str, path: &str) -> Vec<h3::Header> {
@@ -205,7 +214,7 @@ impl CapsuleParser {
             CAPSULE_ADDRESS_REQUEST => Capsule::AddressRequest,
             CAPSULE_ROUTE_ADVERTISEMENT => {
                 Capsule::RouteAdvertisement(parse_route_advertisement(&value)?)
-            },
+            }
             CAPSULE_DATAGRAM => Capsule::Datagram(value),
             other => Capsule::Unknown {
                 kind: other,
@@ -291,8 +300,10 @@ fn oct(e: octets::BufferTooShortError) -> AetherError {
     AetherError::Capsule(e.to_string())
 }
 
-pub fn build_dns_probe_packet(src: Ipv4Addr) -> Vec<u8> {
-    let dns = probe_dns_query();
+pub fn build_dns_probe(src: Ipv4Addr) -> DnsProbe {
+    let transaction_id: u16 = rand::random();
+    let source_port: u16 = rand::rng().random_range(20000..60000);
+    let dns = probe_dns_query(transaction_id);
     let udp_len = 8 + dns.len();
     let total_len = 20 + udp_len;
 
@@ -308,22 +319,68 @@ pub fn build_dns_probe_packet(src: Ipv4Addr) -> Vec<u8> {
     pkt.push(17);
     pkt.extend_from_slice(&[0x00, 0x00]);
     pkt.extend_from_slice(&src.octets());
-    pkt.extend_from_slice(&Ipv4Addr::new(8, 8, 8, 8).octets());
+    pkt.extend_from_slice(&PROBE_RESOLVER.octets());
     let csum = ipv4_header_checksum(&pkt[0..20]);
     pkt[10..12].copy_from_slice(&csum.to_be_bytes());
 
-    let sport: u16 = rand::rng().random_range(20000..60000);
-    pkt.extend_from_slice(&sport.to_be_bytes());
+    pkt.extend_from_slice(&source_port.to_be_bytes());
     pkt.extend_from_slice(&53u16.to_be_bytes());
     pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
     pkt.extend_from_slice(&[0x00, 0x00]);
-
     pkt.extend_from_slice(&dns);
-    pkt
+
+    DnsProbe {
+        packet: pkt,
+        source_ip: src,
+        source_port,
+        transaction_id,
+    }
 }
 
-fn probe_dns_query() -> Vec<u8> {
-    let id: u16 = rand::random();
+pub fn build_dns_probe_packet(src: Ipv4Addr) -> Vec<u8> {
+    build_dns_probe(src).packet
+}
+
+pub fn dns_probe_response_matches(packet: &[u8], probe: &DnsProbe) -> bool {
+    if packet.len() < 40 || packet[0] >> 4 != 4 {
+        return false;
+    }
+
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    if ihl < 20 || packet.len() < ihl + 8 + 12 || packet[9] != 17 {
+        return false;
+    }
+
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if total_len < ihl + 8 + 12 || total_len > packet.len() {
+        return false;
+    }
+
+    if packet[12..16] != PROBE_RESOLVER.octets() || packet[16..20] != probe.source_ip.octets() {
+        return false;
+    }
+
+    let udp = &packet[ihl..total_len];
+    let source_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let destination_port = u16::from_be_bytes([udp[2], udp[3]]);
+    let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+    if source_port != 53
+        || destination_port != probe.source_port
+        || udp_len < 20
+        || udp_len > udp.len()
+    {
+        return false;
+    }
+
+    let dns = &udp[8..udp_len];
+    if dns.len() < 12 || dns[2] & 0x80 == 0 {
+        return false;
+    }
+
+    u16::from_be_bytes([dns[0], dns[1]]) == probe.transaction_id
+}
+
+fn probe_dns_query(id: u16) -> Vec<u8> {
     let mut q = Vec::with_capacity(32);
     q.extend_from_slice(&id.to_be_bytes());
     q.extend_from_slice(&[0x01, 0x00]);
@@ -373,6 +430,17 @@ mod tests {
         assert_eq!(b.get_varint().unwrap(), CAPSULE_DATAGRAM);
         let length = b.get_varint().unwrap() as usize;
         b.get_bytes(length).unwrap().to_vec()
+    }
+
+    fn dns_response_for(probe: &DnsProbe) -> Vec<u8> {
+        let mut response = probe.packet.clone();
+        response[12..16].copy_from_slice(&PROBE_RESOLVER.octets());
+        response[16..20].copy_from_slice(&probe.source_ip.octets());
+        response[20..22].copy_from_slice(&53u16.to_be_bytes());
+        response[22..24].copy_from_slice(&probe.source_port.to_be_bytes());
+        response[28..30].copy_from_slice(&probe.transaction_id.to_be_bytes());
+        response[30] |= 0x80;
+        response
     }
 
     #[test]
@@ -436,7 +504,28 @@ mod tests {
     fn the_h3_path_still_carries_the_context_id() {
         let packet = ip_packet();
         let h3 = encode_ip_datagram(8, &packet).expect("h3 encoding");
-        let decoded = decode_ip_datagram(&h3, 8).expect("h3 decoding").expect("payload");
+        let decoded = decode_ip_datagram(&h3, 8)
+            .expect("h3 decoding")
+            .expect("payload");
         assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn transaction_aware_probe_accepts_only_its_dns_reply() {
+        let probe = build_dns_probe("172.16.0.2".parse().unwrap());
+        let response = dns_response_for(&probe);
+        assert!(dns_probe_response_matches(&response, &probe));
+
+        let mut wrong_id = response.clone();
+        wrong_id[28..30].copy_from_slice(&probe.transaction_id.wrapping_add(1).to_be_bytes());
+        assert!(!dns_probe_response_matches(&wrong_id, &probe));
+
+        let mut wrong_port = response.clone();
+        wrong_port[22..24].copy_from_slice(&probe.source_port.wrapping_add(1).to_be_bytes());
+        assert!(!dns_probe_response_matches(&wrong_port, &probe));
+
+        let mut query_shaped = response;
+        query_shaped[30] &= !0x80;
+        assert!(!dns_probe_response_matches(&query_shaped, &probe));
     }
 }

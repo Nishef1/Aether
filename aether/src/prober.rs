@@ -457,6 +457,26 @@ async fn verify_one(
     }
 }
 
+fn interleave_ip_families(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>, ip: IpScan) -> Vec<IpAddr> {
+    match ip {
+        IpScan::V4 => v4.into_iter().map(IpAddr::V4).collect(),
+        IpScan::V6 => v6.into_iter().map(IpAddr::V6).collect(),
+        IpScan::Both => {
+            let mut out = Vec::with_capacity(v4.len() + v6.len());
+            let max_len = v4.len().max(v6.len());
+            for index in 0..max_len {
+                if let Some(addr) = v4.get(index) {
+                    out.push(IpAddr::V4(*addr));
+                }
+                if let Some(addr) = v6.get(index) {
+                    out.push(IpAddr::V6(*addr));
+                }
+            }
+            out
+        }
+    }
+}
+
 fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
     let fallback = [443u16];
     let ports: &[u16] = if ports.is_empty() { &fallback } else { ports };
@@ -473,13 +493,12 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
     let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
 
-    // Ordered IP list: anchors first, then the pool round-robin across
-    // CIDRs (same head order as before — the most likely responders lead).
-    let mut ips: Vec<IpAddr> = Vec::new();
+    // Build each address family independently, then interleave them in dual-stack
+    // mode so a large IPv4 pool cannot consume the entire scan deadline before
+    // the first IPv6 candidate is even attempted.
+    let mut ips4: Vec<Ipv4Addr> = Vec::new();
     if ip.want_v4() {
-        for a in &seeds {
-            ips.push(IpAddr::V4(*a));
-        }
+        ips4.extend(seeds.iter().copied());
         let cidr_hosts: Vec<Vec<Ipv4Addr>> = masque_cidrs_v4()
             .iter()
             .map(|c| {
@@ -494,16 +513,15 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         for i in 0..max_len {
             for hosts in &cidr_hosts {
                 if let Some(a) = hosts.get(i) {
-                    ips.push(IpAddr::V4(*a));
+                    ips4.push(*a);
                 }
             }
         }
     }
 
+    let mut ips6: Vec<Ipv6Addr> = Vec::new();
     if ip.want_v6() {
-        for a in &seeds6 {
-            ips.push(IpAddr::V6(*a));
-        }
+        ips6.extend(seeds6.iter().copied());
         let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
         let cidr6: Vec<Vec<Ipv6Addr>> = masque_cidrs_v6()
             .iter()
@@ -513,11 +531,13 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         for i in 0..max6 {
             for hosts in &cidr6 {
                 if let Some(a) = hosts.get(i) {
-                    ips.push(IpAddr::V6(*a));
+                    ips6.push(*a);
                 }
             }
         }
     }
+
+    let ips = interleave_ip_families(ips4, ips6, ip);
 
     // Wave 0: the ordered list on rotated ports, so the scan head spreads
     // across ports instead of hammering 443 (same shape as the WG sweep).
@@ -968,6 +988,17 @@ mod tests {
         }
         let head: HashSet<u16> = out[..ports.len()].iter().map(|(_, p)| *p).collect();
         assert_eq!(head.len(), ports.len(), "scan head must spread across ports");
+    }
+
+    #[test]
+    fn dual_stack_scan_head_interleaves_ipv4_and_ipv6() {
+        let st = ScanMode::Turbo.strategy();
+        let out = build_candidates(&st, &[443], IpScan::Both);
+        assert!(out.len() >= 4);
+        assert!(out[0].0.is_ipv4());
+        assert!(out[1].0.is_ipv6());
+        assert!(out[2].0.is_ipv4());
+        assert!(out[3].0.is_ipv6());
     }
 
     #[test]

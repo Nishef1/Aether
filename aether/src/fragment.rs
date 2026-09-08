@@ -11,9 +11,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub enum MaskMode {
     Off,
     LegacyTcpFragment,
-    /// Deterministic TCP write boundaries over the cleartext TLS ClientHello.
-    /// This does not rewrite TLS records; it only changes how their bytes are
-    /// presented to the socket.
+    /// Best-effort deterministic TCP write boundaries over the cleartext TLS
+    /// ClientHello. This does not rewrite TLS records; it only controls how
+    /// bytes offered by the TLS implementation are forwarded to the socket.
     ClientHelloTcpSplit,
     /// Best-effort TCP split preset inspired by the public Patterniha finalMask
     /// layout. It deliberately remains experimental because Xray's packet
@@ -71,6 +71,13 @@ impl MaskMode {
             Self::PatternihaExperimental => &[5, 94, 1, 109, 1],
             _ => &[],
         }
+    }
+
+    fn is_deterministic(self) -> bool {
+        matches!(
+            self,
+            Self::ClientHelloTcpSplit | Self::PatternihaExperimental
+        )
     }
 }
 
@@ -142,19 +149,12 @@ impl FragmentConfig {
         Duration::from_millis(ms)
     }
 
-    fn chunk_len(&self, remaining: usize, split_index: usize) -> usize {
-        match self.mode {
-            MaskMode::Off => remaining,
-            MaskMode::LegacyTcpFragment => self.pick_legacy_chunk_len(remaining),
-            MaskMode::ClientHelloTcpSplit | MaskMode::PatternihaExperimental => self
-                .mode
-                .deterministic_splits()
-                .get(split_index)
-                .copied()
-                .unwrap_or(remaining)
-                .max(1)
-                .min(remaining),
-        }
+    fn deterministic_split_len(&self, split_index: usize) -> Option<usize> {
+        self.mode
+            .deterministic_splits()
+            .get(split_index)
+            .copied()
+            .map(|value| value.max(1))
     }
 
     fn delay_after_split(&self, split_index: usize) -> Duration {
@@ -202,6 +202,10 @@ pub struct FragmentingStream<S> {
     cfg: FragmentConfig,
     fragmenting: bool,
     split_index: usize,
+    /// Bytes still required to complete the current deterministic split.
+    /// AsyncWrite permits short writes, so advancing the split index after any
+    /// successful write would shift all later boundaries under backpressure.
+    split_remaining: usize,
     pending_delay: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
@@ -212,7 +216,29 @@ impl<S> FragmentingStream<S> {
             fragmenting: cfg.enabled,
             cfg,
             split_index: 0,
+            split_remaining: 0,
             pending_delay: None,
+        }
+    }
+
+    fn complete_split(&mut self, split_index: usize) {
+        self.split_index = self.split_index.saturating_add(1);
+        self.split_remaining = 0;
+
+        let delay = self.cfg.delay_after_split(split_index);
+        if !delay.is_zero() {
+            self.pending_delay = Some(Box::pin(tokio::time::sleep(delay)));
+        }
+
+        if self.cfg.mode.is_deterministic()
+            && self
+                .cfg
+                .deterministic_split_len(self.split_index)
+                .is_none()
+        {
+            // The requested mask sequence is complete. Forward the rest of the
+            // ClientHello in the TLS implementation's natural write pattern.
+            self.fragmenting = false;
         }
     }
 }
@@ -230,6 +256,7 @@ where
         // Once the server starts answering, the ClientHello phase is over. Do
         // not fragment application traffic or subsequent TLS records.
         this.fragmenting = false;
+        this.split_remaining = 0;
         Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
@@ -257,16 +284,37 @@ where
         }
 
         let split_index = this.split_index;
-        let chunk_len = this.cfg.chunk_len(buf.len(), split_index);
+        let deterministic = this.cfg.mode.is_deterministic();
+        let chunk_len = if deterministic {
+            if this.split_remaining == 0 {
+                let Some(target) = this.cfg.deterministic_split_len(split_index) else {
+                    this.fragmenting = false;
+                    return Pin::new(&mut this.inner).poll_write(cx, buf);
+                };
+                this.split_remaining = target;
+            }
+            this.split_remaining.min(buf.len())
+        } else {
+            this.cfg.pick_legacy_chunk_len(buf.len())
+        };
+
         match Pin::new(&mut this.inner).poll_write(cx, &buf[..chunk_len]) {
             Poll::Ready(Ok(n)) => {
-                if n > 0 {
-                    this.split_index = this.split_index.saturating_add(1);
-                    let delay = this.cfg.delay_after_split(split_index);
-                    if !delay.is_zero() {
-                        this.pending_delay = Some(Box::pin(tokio::time::sleep(delay)));
-                    }
+                if n == 0 {
+                    return Poll::Ready(Ok(0));
                 }
+
+                if deterministic {
+                    this.split_remaining = this.split_remaining.saturating_sub(n);
+                    if this.split_remaining == 0 {
+                        this.complete_split(split_index);
+                    }
+                } else {
+                    // Legacy mode intentionally treats every successful socket
+                    // write as a fragment, including an underlying short write.
+                    this.complete_split(split_index);
+                }
+
                 Poll::Ready(Ok(n))
             }
             other => other,
@@ -285,6 +333,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn clear_mask_env() {
         std::env::remove_var("AETHER_MASQUE_H2_MASK");
@@ -337,10 +386,10 @@ mod tests {
             delay_min_ms: 2,
             delay_max_ms: 10,
         };
-        assert_eq!(cfg.chunk_len(512, 0), 5);
-        assert_eq!(cfg.chunk_len(507, 1), 94);
-        assert_eq!(cfg.chunk_len(413, 2), 1);
-        assert_eq!(cfg.chunk_len(412, 3), 412);
+        assert_eq!(cfg.deterministic_split_len(0), Some(5));
+        assert_eq!(cfg.deterministic_split_len(1), Some(94));
+        assert_eq!(cfg.deterministic_split_len(2), Some(1));
+        assert_eq!(cfg.deterministic_split_len(3), None);
     }
 
     #[test]
@@ -355,8 +404,60 @@ mod tests {
         };
         let expected = [5, 94, 1, 109, 1];
         for (index, size) in expected.into_iter().enumerate() {
-            assert_eq!(cfg.chunk_len(512, index), size);
+            assert_eq!(cfg.deterministic_split_len(index), Some(size));
         }
-        assert_eq!(cfg.chunk_len(512, expected.len()), 512);
+        assert_eq!(cfg.deterministic_split_len(expected.len()), None);
+    }
+
+    #[derive(Default)]
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        writes: Vec<usize>,
+        max_per_write: usize,
+    }
+
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = buf.len().min(self.max_per_write.max(1));
+            self.bytes.extend_from_slice(&buf[..n]);
+            self.writes.push(n);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_split_progress_survives_underlying_short_writes() {
+        let cfg = FragmentConfig {
+            enabled: true,
+            mode: MaskMode::ClientHelloTcpSplit,
+            size_min: 16,
+            size_max: 32,
+            delay_min_ms: 0,
+            delay_max_ms: 0,
+        };
+        let inner = ShortWriter {
+            max_per_write: 2,
+            ..ShortWriter::default()
+        };
+        let mut stream = FragmentingStream::new(inner, cfg);
+        let payload = vec![0x16; 128];
+        stream.write_all(&payload).await.unwrap();
+
+        assert_eq!(stream.inner.bytes, payload);
+        assert_eq!(stream.split_index, 3);
+        assert_eq!(stream.split_remaining, 0);
+        assert!(!stream.fragmenting);
     }
 }

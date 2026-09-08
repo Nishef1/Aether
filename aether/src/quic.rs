@@ -21,15 +21,19 @@ fn net_queue() -> usize {
 }
 
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
-    use socket2::{Socket, Domain, Type};
-    let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    use socket2::{Domain, Socket, Type};
+    let domain = if bind_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let sock = Socket::new(domain, Type::DGRAM, None).map_err(AetherError::Io)?;
     sock.set_nonblocking(true).map_err(AetherError::Io)?;
-    
+
     let buf_size = crate::sysprofile::udp_socket_buf_bytes();
     let _ = sock.set_recv_buffer_size(buf_size);
     let _ = sock.set_send_buffer_size(buf_size);
-    
+
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
 }
@@ -153,7 +157,11 @@ impl Drop for ReaderGuard {
     }
 }
 
-fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPacket>) -> tokio::task::JoinHandle<()> {
+fn spawn_reader(
+    sock: Arc<UdpSocket>,
+    local: SocketAddr,
+    tx: mpsc::Sender<NetPacket>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -164,7 +172,7 @@ fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPac
                     if tx.send((local, from, buf[..n].to_vec())).await.is_err() {
                         break;
                     }
-                },
+                }
                 Err(e) => {
                     log::debug!("recv error: {e}");
                     break;
@@ -183,7 +191,7 @@ pub async fn run(
     let peer = cfg.peer;
     let quiet = cfg.quiet;
     let data_check = data_check_enabled();
-    let probe_packet = masque::build_dns_probe_packet(cfg.local_ipv4);
+    let mut probe = masque::build_dns_probe(cfg.local_ipv4);
     let mut ready_tx = ready_tx;
     let mut ready_fired = false;
     let mut validate_deadline: Option<Instant> = None;
@@ -252,7 +260,7 @@ pub async fn run(
                     );
                     let _ = conn.close(true, 0x00, b"validation-timeout");
                     return Err(AetherError::Masque(
-                        "data-plane validation timeout (handshake ok, no traffic)".into(),
+                        "data-plane validation timeout (handshake ok, no matching DNS reply)".into(),
                     ));
                 }
             }
@@ -262,7 +270,7 @@ pub async fn run(
 
         tokio::select! {
             biased;
-            
+
             _ = keepalive_interval.tick() => {
                 if conn.is_established() {
                     if let Err(e) = conn.send_ack_eliciting() {
@@ -273,7 +281,7 @@ pub async fn run(
 
             _ = probe_interval.tick(), if data_check && !ready_fired => {
                 if let Some(sid) = req_stream {
-                    match masque::encode_ip_datagram(sid, &probe_packet) {
+                    match masque::encode_ip_datagram(sid, &probe.packet) {
                         Ok(framed) => {
                             if let Err(e) = conn.dgram_send(&framed) {
                                 log::trace!("data-plane probe send: {e}");
@@ -341,10 +349,13 @@ pub async fn run(
 
         if conn.is_established() && h3_conn.is_none() {
             established_ever = true;
-            log_or_debug(quiet, format!(
-                "quic handshake established; alpn={}",
-                String::from_utf8_lossy(conn.application_proto())
-            ));
+            log_or_debug(
+                quiet,
+                format!(
+                    "quic handshake established; alpn={}",
+                    String::from_utf8_lossy(conn.application_proto())
+                ),
+            );
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&cfg.authority, &cfg.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
@@ -354,7 +365,11 @@ pub async fn run(
 
             if data_check {
                 validate_deadline = Some(Instant::now() + validation_timeout());
-                log_or_debug(quiet, "[*] validating masque data-plane before exposing socks5".to_string());
+                log_or_debug(
+                    quiet,
+                    "[*] validating masque data-plane with matching DNS transactions before exposing socks5"
+                        .to_string(),
+                );
             } else if !ready_fired {
                 ready_fired = true;
                 if let Some(tx) = ready_tx.take() {
@@ -367,14 +382,20 @@ pub async fn run(
             poll_h3(&mut conn, h3c, sid, &mut capsules, &addr_tx, quiet)?;
         }
 
-        let got_data =
-            drain_datagrams(&mut conn, req_stream, &internals.inbound_tx, &mut out_buf);
+        let got_probe_reply = drain_datagrams(
+            &mut conn,
+            req_stream,
+            &internals.inbound_tx,
+            &mut out_buf,
+            &probe,
+        );
 
-        if got_data && !ready_fired {
+        if got_probe_reply && !ready_fired {
             validate_successes += 1;
             log::debug!(
-                "[*] masque data-plane round-trip {}/{} confirmed",
-                validate_successes, DATA_PROBE_REQUIRED_SUCCESSES
+                "[*] masque DNS transaction {}/{} confirmed",
+                validate_successes,
+                DATA_PROBE_REQUIRED_SUCCESSES
             );
             if validate_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
                 ready_fired = true;
@@ -382,7 +403,13 @@ pub async fn run(
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(());
                 }
-                log_or_debug(quiet, "[+] masque tunnel validated (end-to-end data confirmed); exposing socks5".to_string());
+                log_or_debug(
+                    quiet,
+                    "[+] masque tunnel validated (matching DNS transactions confirmed); exposing socks5"
+                        .to_string(),
+                );
+            } else {
+                probe = masque::build_dns_probe(cfg.local_ipv4);
             }
         }
 
@@ -408,6 +435,8 @@ pub async fn run(
                     h3_conn = None;
                     req_stream = None;
                     capsules = CapsuleParser::new();
+                    probe = masque::build_dns_probe(cfg.local_ipv4);
+                    validate_successes = 0;
                     flush(&mut conn, &sockets).await?;
                     continue;
                 }
@@ -415,20 +444,26 @@ pub async fn run(
 
             log_or_debug(quiet, format!("connection closed: {:?}", conn.stats()));
             if let Some(e) = conn.peer_error() {
-                log_or_debug(quiet, format!(
-                    "peer closed: code=0x{:x} app={} reason={}",
-                    e.error_code,
-                    e.is_app,
-                    String::from_utf8_lossy(&e.reason)
-                ));
+                log_or_debug(
+                    quiet,
+                    format!(
+                        "peer closed: code=0x{:x} app={} reason={}",
+                        e.error_code,
+                        e.is_app,
+                        String::from_utf8_lossy(&e.reason)
+                    ),
+                );
             }
             if let Some(e) = conn.local_error() {
-                log_or_debug(quiet, format!(
-                    "local closed: code=0x{:x} app={} reason={}",
-                    e.error_code,
-                    e.is_app,
-                    String::from_utf8_lossy(&e.reason)
-                ));
+                log_or_debug(
+                    quiet,
+                    format!(
+                        "local closed: code=0x{:x} app={} reason={}",
+                        e.error_code,
+                        e.is_app,
+                        String::from_utf8_lossy(&e.reason)
+                    ),
+                );
             }
             return Ok(());
         }
@@ -465,7 +500,13 @@ fn poll_h3(
             Ok((_stream_id, h3::Event::Headers { list, .. })) => {
                 for h in &list {
                     if h.name() == b":status" {
-                        log_or_debug(quiet, format!("connect-ip status: {}", String::from_utf8_lossy(h.value())));
+                        log_or_debug(
+                            quiet,
+                            format!(
+                                "connect-ip status: {}",
+                                String::from_utf8_lossy(h.value())
+                            ),
+                        );
                     }
                 }
             }
@@ -526,9 +567,9 @@ fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<As
 
 fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
     match version {
-        4 if bytes.len() == 4 => {
-            Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into()))
-        }
+        4 if bytes.len() == 4 => Some(IpAddr::V4(
+            [bytes[0], bytes[1], bytes[2], bytes[3]].into(),
+        )),
         6 if bytes.len() == 16 => {
             let mut b = [0u8; 16];
             b.copy_from_slice(bytes);
@@ -543,24 +584,28 @@ fn drain_datagrams(
     req_stream: Option<u64>,
     inbound_tx: &mpsc::Sender<Vec<u8>>,
     buf: &mut [u8],
+    probe: &masque::DnsProbe,
 ) -> bool {
     let sid = match req_stream {
         Some(s) => s,
         None => return false,
     };
 
-    let mut delivered = false;
+    let mut probe_confirmed = false;
     loop {
         match conn.dgram_recv(buf) {
             Ok(n) => match masque::decode_ip_datagram(&buf[..n], sid) {
                 Ok(Some(ip_packet)) => {
-                    delivered = true;
+                    if masque::dns_probe_response_matches(&ip_packet, probe) {
+                        probe_confirmed = true;
+                        continue;
+                    }
                     match inbound_tx.try_send(ip_packet) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             log::trace!("inbound queue full, dropping datagram");
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return delivered,
+                        Err(mpsc::error::TrySendError::Closed(_)) => return probe_confirmed,
                     }
                 }
                 Ok(None) => {}
@@ -573,7 +618,7 @@ fn drain_datagrams(
             }
         }
     }
-    delivered
+    probe_confirmed
 }
 
 async fn flush(
@@ -654,11 +699,16 @@ pub struct VerifyParams {
 }
 
 pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
-    let bind: SocketAddr = if p.peer.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+    let bind: SocketAddr = if p.peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
     let sock = bind_udp_fast(bind).await?;
     crate::upstream::attach_detour(&sock, p.peer).await?;
     let local = sock.local_addr()?;
-    sock.connect(crate::upstream::relay_target(local, p.peer)).await?;
+    sock.connect(crate::upstream::relay_target(local, p.peer))
+        .await?;
 
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &p.cert_pem,
@@ -680,7 +730,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let mut req_stream: Option<u64> = None;
 
     let data_check = data_check_enabled();
-    let probe_packet = masque::build_dns_probe_packet(p.local_ipv4);
+    let mut probe = masque::build_dns_probe(p.local_ipv4);
     let mut connect_ip_ok = false;
     let mut last_probe = Instant::now();
     let mut dgram_buf = vec![0u8; 65535];
@@ -697,7 +747,9 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
 
     loop {
         if Instant::now() >= deadline {
-            return Err(AetherError::Other("verify timeout".into()));
+            return Err(AetherError::Other(
+                "verify timeout waiting for matching DNS reply".into(),
+            ));
         }
 
         let wait = match conn.timeout() {
@@ -750,12 +802,10 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                         return Ok(start.elapsed());
                                     }
                                     connect_ip_ok = true;
-                                    if let Some(sid) = req_stream {
-                                        if let Ok(framed) =
-                                            masque::encode_ip_datagram(sid, &probe_packet)
-                                        {
-                                            let _ = conn.dgram_send(&framed);
-                                        }
+                                    if let Ok(framed) =
+                                        masque::encode_ip_datagram(sid, &probe.packet)
+                                    {
+                                        let _ = conn.dgram_send(&framed);
                                     }
                                     last_probe = Instant::now();
                                 } else {
@@ -777,7 +827,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         if connect_ip_ok {
             if last_probe.elapsed() >= Duration::from_millis(700) {
                 if let Some(sid) = req_stream {
-                    if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_packet) {
+                    if let Ok(framed) = masque::encode_ip_datagram(sid, &probe.packet) {
                         let _ = conn.dgram_send(&framed);
                     }
                 }
@@ -788,12 +838,22 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                 loop {
                     match conn.dgram_recv(&mut dgram_buf) {
                         Ok(n) => {
-                            if let Ok(Some(_)) = masque::decode_ip_datagram(&dgram_buf[..n], sid) {
+                            if let Ok(Some(ip_packet)) =
+                                masque::decode_ip_datagram(&dgram_buf[..n], sid)
+                            {
+                                if !masque::dns_probe_response_matches(&ip_packet, &probe) {
+                                    continue;
+                                }
+
                                 probe_successes += 1;
                                 if probe_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
                                     return Ok(start.elapsed());
                                 }
-                                if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_packet) {
+
+                                probe = masque::build_dns_probe(p.local_ipv4);
+                                if let Ok(framed) =
+                                    masque::encode_ip_datagram(sid, &probe.packet)
+                                {
                                     let _ = conn.dgram_send(&framed);
                                 }
                                 last_probe = Instant::now();
@@ -809,7 +869,9 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         flush_connected(&mut conn, &sock).await?;
 
         if conn.is_closed() {
-            return Err(AetherError::Other("closed before data-plane confirmation".into()));
+            return Err(AetherError::Other(
+                "closed before matching DNS transaction confirmation".into(),
+            ));
         }
     }
 }

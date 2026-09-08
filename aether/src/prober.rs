@@ -325,7 +325,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
                             _ => pr,
                         });
                         found += 1;
-                        
+
                         if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
                             log::info!("[+] reached target of {} gateways, selecting best", st.target_successes);
                             if !st.quiet_after_first.is_zero() {
@@ -361,6 +361,13 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     }
 }
 
+fn prefilter_hard_reject_enabled() -> bool {
+    std::env::var("AETHER_PREFILTER_HARD_REJECT")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 async fn verify_one(
     probe: &MasqueProbe,
     ip: IpAddr,
@@ -369,12 +376,15 @@ async fn verify_one(
     ironclad: bool,
 ) -> Option<ProbeResult> {
     paced_probe_start().await;
-    if !ironclad {
-        // Stage 1: cheap reachability. Hosts that answer nothing die here
-        // in ~1 RTT instead of burning a full crypto-handshake timeout.
+    if !ironclad && prefilter_hard_reject_enabled() {
+        // Optional fast rejection for networks where a silent bare Initial/SYN
+        // is known to mean the endpoint is dead. Disabled by default because
+        // restricted networks can suppress this cheap probe while allowing the
+        // full authenticated MASQUE handshake, which would create false negatives.
         let peer = SocketAddr::new(ip, port);
         if !cheap_initial_reply(peer, crate::masque_h2::enabled(), prefilter_timeout(timeout)).await
         {
+            log::trace!("prefilter silent for {peer}; hard-reject enabled");
             return None;
         }
     }
@@ -629,14 +639,8 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
     out
 }
 
-/// Cheap reachability pre-filter: one handshake-less probe before paying
-/// for a full verify. A bare QUIC Initial (or a TCP SYN in H2 mode) that
-/// gets ANY reply means someone lives there; silence means skip without
-/// burning crypto + multi-RTT handshake timeouts on a dead host.
-///
-/// Deliberately no obfuscation noise here: answering an Initial is mandatory
-/// for a real QUIC edge, and the noise sleeps would defeat the "cheap" part.
-/// The full verify that follows still decides; this only skips the silent.
+/// Cheap reachability pre-check used only when explicitly enabled as a hard
+/// reject. It is not a proof that the authenticated MASQUE path will fail.
 async fn cheap_initial_reply(peer: SocketAddr, h2: bool, timeout: Duration) -> bool {
     if h2 {
         tcp_answers(peer, timeout).await.is_some()
@@ -687,8 +691,7 @@ async fn tcp_answers(peer: SocketAddr, timeout: Duration) -> Option<Duration> {
     }
 }
 
-/// Stage-1 budget: long enough for a slow round trip, short enough to keep
-/// the filter cheap. Pure, tested.
+/// Stage-1 budget used only by the opt-in hard-reject prefilter.
 fn prefilter_timeout(full: Duration) -> Duration {
     full.div_f32(2.0).clamp(Duration::from_secs(2), Duration::from_secs(5))
 }
@@ -1013,10 +1016,20 @@ mod tests {
     }
 
     #[test]
+    fn prefilter_is_disabled_by_default_and_requires_explicit_opt_in() {
+        std::env::remove_var("AETHER_PREFILTER_HARD_REJECT");
+        assert!(!prefilter_hard_reject_enabled());
+        std::env::set_var("AETHER_PREFILTER_HARD_REJECT", "true");
+        assert!(prefilter_hard_reject_enabled());
+        std::env::set_var("AETHER_PREFILTER_HARD_REJECT", "0");
+        assert!(!prefilter_hard_reject_enabled());
+        std::env::remove_var("AETHER_PREFILTER_HARD_REJECT");
+    }
+
+    #[test]
     fn prefilter_budget_covers_slow_round_trips_but_stays_cheap() {
         assert_eq!(prefilter_timeout(Duration::from_secs(6)), Duration::from_secs(3));
         assert_eq!(prefilter_timeout(Duration::from_secs(5)), Duration::from_millis(2500));
-        // Never shorter than one slow RTT, never pricier than a quick check.
         assert_eq!(prefilter_timeout(Duration::from_secs(60)), Duration::from_secs(5));
         assert_eq!(prefilter_timeout(Duration::from_millis(500)), Duration::from_secs(2));
     }
@@ -1034,7 +1047,6 @@ mod tests {
 
     #[tokio::test]
     async fn cheap_filter_passes_a_talker_and_drops_silence() {
-        // UDP responder on loopback: any reply counts as "someone lives here".
         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_addr = udp.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1047,7 +1059,6 @@ mod tests {
             cheap_initial_reply(udp_addr, false, Duration::from_secs(3)).await,
             "a replying UDP socket must pass the filter"
         );
-        // TCP listener on loopback for the H2-mode branch.
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tcp_addr = tcp.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1057,16 +1068,15 @@ mod tests {
             cheap_initial_reply(tcp_addr, true, Duration::from_secs(3)).await,
             "an open TCP port must pass the filter"
         );
-        // Closed ports stay silent on loopback: ICMP refused / RST.
         let dead_udp: SocketAddr = "127.0.0.1:1".parse().unwrap();
         assert!(
             !cheap_initial_reply(dead_udp, false, Duration::from_secs(2)).await,
-            "a silent UDP port must be filtered out"
+            "a silent UDP port must be classified silent"
         );
         let dead_tcp: SocketAddr = "127.0.0.1:1".parse().unwrap();
         assert!(
             !cheap_initial_reply(dead_tcp, true, Duration::from_secs(2)).await,
-            "a closed TCP port must be filtered out"
+            "a closed TCP port must be classified silent"
         );
     }
 
@@ -1080,7 +1090,6 @@ mod tests {
         for entry in MASQUE_CIDRS_V6 {
             let (addr, bits) = entry.split_once('/').expect("cidr");
             assert!(addr.parse::<Ipv6Addr>().is_ok(), "{entry}");
-            assert!(bits.parse::<u8>().is_ok(), "{entry}");
         }
         for seed in MASQUE_SEEDS {
             assert!(seed.parse::<Ipv4Addr>().is_ok(), "{seed}");

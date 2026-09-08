@@ -25,7 +25,132 @@ extern "C" {
     );
 }
 
-const CHROME_GROUPS: &str = "P-256:X25519:P-384";
+const CURRENT_GROUPS: &str = "P-256:X25519:P-384";
+const MINIMAL_GROUPS: &str = "X25519:P-256";
+const EXPERIMENTAL_GROUPS: &str = "X25519:P-256:P-384";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsCarrier {
+    H2,
+    H3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsProfile {
+    Automatic,
+    Current,
+    NativeMinimal,
+    Compatibility,
+    Experimental,
+}
+
+impl TlsProfile {
+    fn from_env() -> Self {
+        match std::env::var("AETHER_TLS_PROFILE")
+            .unwrap_or_else(|_| "automatic".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "current" | "boringssl" | "current-boringssl" => Self::Current,
+            "native-minimal" | "minimal" | "native" => Self::NativeMinimal,
+            "compatibility" | "compat" => Self::Compatibility,
+            "experimental" | "experiment" => Self::Experimental,
+            _ => Self::Automatic,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Current => "current-boringssl",
+            Self::NativeMinimal => "native-minimal",
+            Self::Compatibility => "compatibility",
+            Self::Experimental => "experimental",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TlsPolicy {
+    tls13_only: bool,
+    grease: bool,
+    groups: &'static str,
+}
+
+fn policy_for(profile: TlsProfile, carrier: TlsCarrier) -> TlsPolicy {
+    let current = TlsPolicy {
+        tls13_only: carrier == TlsCarrier::H3,
+        grease: true,
+        groups: CURRENT_GROUPS,
+    };
+
+    match profile {
+        TlsProfile::Automatic | TlsProfile::Current => current,
+        TlsProfile::NativeMinimal => TlsPolicy {
+            tls13_only: true,
+            grease: false,
+            groups: MINIMAL_GROUPS,
+        },
+        TlsProfile::Compatibility => TlsPolicy {
+            tls13_only: carrier == TlsCarrier::H3,
+            grease: false,
+            groups: CURRENT_GROUPS,
+        },
+        TlsProfile::Experimental => TlsPolicy {
+            tls13_only: true,
+            grease: true,
+            groups: EXPERIMENTAL_GROUPS,
+        },
+    }
+}
+
+pub fn apply_client_profile(builder: &mut SslContextBuilder, carrier: TlsCarrier) -> Result<()> {
+    let profile = TlsProfile::from_env();
+    let policy = policy_for(profile, carrier);
+
+    builder
+        .set_min_proto_version(Some(if policy.tls13_only {
+            SslVersion::TLS1_3
+        } else {
+            SslVersion::TLS1_2
+        }))
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    builder.set_grease_enabled(policy.grease);
+
+    // Manual groups remain an expert override above the named profile.
+    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
+    let groups = groups
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(policy.groups);
+    builder
+        .set_curves_list(groups)
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+
+    announce_profile_once(format!(
+        "tls profile: {} carrier={:?} tls13_only={} grease={} groups={groups}",
+        profile.label(),
+        carrier,
+        policy.tls13_only,
+        policy.grease,
+    ));
+    Ok(())
+}
+
+fn announce_profile_once(message: String) {
+    use std::sync::OnceLock;
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    if ANNOUNCED.set(()).is_ok() {
+        log::info!("{message}");
+    } else {
+        log::debug!("{message}");
+    }
+}
 
 pub struct TlsParams<'a> {
     pub cert_pem: &'a [u8],
@@ -70,8 +195,6 @@ pub fn install_verification(
     if pin_endpoint && !expected_pins.is_empty() {
         let pins: Vec<Vec<u8>> = expected_pins.iter().map(|p| p.to_vec()).collect();
         builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
-            // Pin-only verification: check leaf cert SPKI hash against known pins.
-            // No CA chain verification — Cloudflare MASQUE edges use self-signed certs.
             let leaf_cert = ssl.peer_certificate().ok_or_else(|| {
                 log::warn!("tls pin: no peer certificate presented");
                 SslVerifyError::Invalid(boring::ssl::SslAlert::BAD_CERTIFICATE)
@@ -100,12 +223,6 @@ pub fn install_verification(
             expected_pins.len()
         ));
     } else {
-        // No pin-based verification configured — disable server cert verification.
-        // This is required because Aether connects to Cloudflare edge IPs with
-        // SNI=consumer-masque.cloudflareclient.com but the edge may present a
-        // different certificate or the SNI may be empty/transformed for DPI bypass.
-        // Standard CA validation fails in this context. The security model relies on
-        // the encrypted MASQUE tunnel and ECH rather than TLS cert verification.
         builder.set_verify(SslVerifyMode::NONE);
         announce_once("tls verification: disabled (no pin configured)".to_string());
     }
@@ -126,19 +243,7 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    builder
-        .set_min_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-    builder
-        .set_max_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-
-    builder.set_grease_enabled(true);
-    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
-    let groups = groups.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(CHROME_GROUPS);
-    builder
-        .set_curves_list(groups)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    apply_client_profile(&mut builder, TlsCarrier::H3)?;
 
     let mut alpn = Vec::with_capacity(consts::ALPN_H3.len() + 1);
     alpn.push(consts::ALPN_H3.len() as u8);
@@ -157,7 +262,6 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    // Install TLS verification (pin-based or standard CA chain)
     install_verification(&mut builder, params.pin_endpoint, params.expected_pins)?;
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
@@ -227,4 +331,45 @@ pub fn decode_ech_config_list(b64: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|e| AetherError::Ech(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_h2_keeps_existing_tls12_to_tls13_compatibility() {
+        let policy = policy_for(TlsProfile::Current, TlsCarrier::H2);
+        assert!(!policy.tls13_only);
+        assert!(policy.grease);
+        assert_eq!(policy.groups, CURRENT_GROUPS);
+    }
+
+    #[test]
+    fn h3_is_tls13_only_for_every_nonexperimental_compatibility_profile() {
+        for profile in [
+            TlsProfile::Automatic,
+            TlsProfile::Current,
+            TlsProfile::NativeMinimal,
+            TlsProfile::Compatibility,
+        ] {
+            assert!(policy_for(profile, TlsCarrier::H3).tls13_only);
+        }
+    }
+
+    #[test]
+    fn minimal_reduces_surface_without_disabling_pin_verification() {
+        let policy = policy_for(TlsProfile::NativeMinimal, TlsCarrier::H2);
+        assert!(policy.tls13_only);
+        assert!(!policy.grease);
+        assert_eq!(policy.groups, MINIMAL_GROUPS);
+    }
+
+    #[test]
+    fn experimental_only_changes_client_hello_shape_policy() {
+        let policy = policy_for(TlsProfile::Experimental, TlsCarrier::H2);
+        assert!(policy.tls13_only);
+        assert!(policy.grease);
+        assert_eq!(policy.groups, EXPERIMENTAL_GROUPS);
+    }
 }

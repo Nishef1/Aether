@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+use parking_lot::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use boringtun::noise::{Tunn, TunnResult};
@@ -10,10 +10,14 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::aethernoize::{self, AetherNoizeConfig};
 use crate::error::{AetherError, Result};
-use rand::Rng;
+use rand::RngExt;
 
 const TIMER_TICK: Duration = Duration::from_millis(250);
 const MAX_PACKET: usize = 65536;
+const VERIFY_RETRY_DELAYS: [Duration; 2] = [
+    Duration::from_millis(750),
+    Duration::from_millis(2_000),
+];
 
 const WG_MSG_TYPE_MIN: u8 = 1;
 const WG_MSG_TYPE_MAX: u8 = 4;
@@ -100,21 +104,13 @@ pub struct EstablishedSession {
 
 impl WgTunnel {
     pub async fn new(cfg: WgConfig, inbound_tx: mpsc::Sender<Vec<u8>>) -> Result<Self> {
-        let bind_addr = if cfg.peer_endpoint.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-
-        let sock = UdpSocket::bind(bind_addr).await?;
-        sock.connect(cfg.peer_endpoint).await?;
+        let (sock, _) = crate::upstream::bind_via_upstream(cfg.peer_endpoint).await?;
 
         let local_secret = StaticSecret::from(cfg.local_private_key);
         let peer_public = PublicKey::from(cfg.peer_public_key);
         let preshared = cfg.preshared_key;
 
-        let tunn = Tunn::new(local_secret, peer_public, preshared, cfg.persistent_keepalive, 0, None)
-            .map_err(|e| AetherError::Other(format!("wireguard tunnel init: {e}")))?;
+        let tunn = Tunn::new(local_secret, peer_public, preshared, cfg.persistent_keepalive, 0, None);
 
         Ok(Self {
             tunn: Arc::new(Mutex::new(Box::new(tunn))),
@@ -157,7 +153,6 @@ impl WgTunnel {
         let tunn_h = self.tunn.clone();
         let inbound_tx = self.inbound_tx.clone();
         let obf_sent = self.obf_sent.clone();
-        let post_hs_junk_sent = Arc::new(AtomicBool::new(false));
         let aethernoize = self.aethernoize.clone();
         let aethernoize_t = self.aethernoize.clone();
         let client_id = self.client_id;
@@ -181,20 +176,20 @@ impl WgTunnel {
                         let mut tunn = tunn_r.lock().await;
                         match tunn.decapsulate(None, &buf[..n], &mut tmp) {
                             TunnResult::Done => {
-                                *last_valid_rx_r.lock().unwrap() = Instant::now();
+                                *last_valid_rx_r.lock() = Instant::now();
                             }
                             TunnResult::Err(e) => {
                                 log::trace!("decapsulate error: {e:?}");
                             }
                             TunnResult::WriteToNetwork(pkt) => {
-                                *last_valid_rx_r.lock().unwrap() = Instant::now();
+                                *last_valid_rx_r.lock() = Instant::now();
                                 let mut pkt_vec = pkt.to_vec();
                                 inject_client_id(&mut pkt_vec, &client_id);
                                 drop(tunn);
                                 let _ = sock_r.send(&pkt_vec).await;
                             }
                             TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
-                                *last_valid_rx_r.lock().unwrap() = Instant::now();
+                                *last_valid_rx_r.lock() = Instant::now();
                                 let pkt_vec = pkt.to_vec();
                                 drop(tunn);
                                 let _ = inbound_tx.send(pkt_vec).await;
@@ -224,9 +219,10 @@ impl WgTunnel {
         });
 
         let send_task = tokio::spawn(async move {
+            let mut out_buf = vec![0u8; MAX_PACKET];
+            let mut post_hs_junk_sent = false;
             while let Some(ip_packet) = outbound_rx.recv().await {
                 let mut tunn = tunn_w.lock().await;
-                let mut out_buf = vec![0u8; MAX_PACKET];
 
                 match tunn.encapsulate(&ip_packet, &mut out_buf) {
                     TunnResult::Done => {}
@@ -249,14 +245,10 @@ impl WgTunnel {
 
                         let _ = sock_w.send(&pkt_vec).await;
 
-                        if aethernoize.jc_after_hs > 0
-                            && !post_hs_junk_sent.swap(true, Ordering::SeqCst)
-                        {
-                            let sock_clone = sock_w.clone();
-                            let cfg_clone = aethernoize.clone();
-                            tokio::spawn(async move {
-                                aethernoize::send_post_handshake_junk(&sock_clone, peer, &cfg_clone).await;
-                            });
+                        // Post-handshake junk once only — not on every data packet.
+                        if aethernoize.jc_after_hs > 0 && !post_hs_junk_sent {
+                            post_hs_junk_sent = true;
+                            aethernoize::send_post_handshake_junk(&sock_w, peer, &aethernoize).await;
                         }
                     }
                     TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {}
@@ -266,25 +258,19 @@ impl WgTunnel {
 
         let timer_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(TIMER_TICK);
+            let mut tmp = vec![0u8; MAX_PACKET];
             loop {
                 interval.tick().await;
                 let mut tunn = tunn_t.lock().await;
-                let mut tmp = vec![0u8; MAX_PACKET];
                 if let TunnResult::WriteToNetwork(pkt) = tunn.update_timers(&mut tmp) {
                     let mut pkt_vec = pkt.to_vec();
                     inject_client_id(&mut pkt_vec, &client_id);
                     drop(tunn);
 
                     if aethernoize_t.is_enabled() {
-                        let sock_j = sock_t.clone();
-                        let cfg_j = aethernoize_t.clone();
-                        tokio::spawn(async move {
-                            aethernoize::send_keepalive_junk(&sock_j, &cfg_j).await;
-                            let _ = sock_j.send(&pkt_vec).await;
-                        });
-                    } else {
-                        let _ = sock_t.send(&pkt_vec).await;
+                        aethernoize::send_keepalive_junk(&sock_t, &aethernoize_t).await;
                     }
+                    let _ = sock_t.send(&pkt_vec).await;
                 }
             }
         });
@@ -297,7 +283,7 @@ impl WgTunnel {
             loop {
                 interval.tick().await;
 
-                let idle = last_valid_rx_h.lock().unwrap().elapsed();
+                let idle = last_valid_rx_h.lock().elapsed();
                 if idle >= stale_timeout {
                     log::warn!(
                         "[wg] no valid data from peer {} in {:?}; tunnel considered dead",
@@ -412,7 +398,7 @@ fn build_dataplane_probe(src: Ipv4Addr) -> Vec<u8> {
     pkt.extend_from_slice(&Ipv4Addr::new(8, 8, 8, 8).octets());
     let csum = ipv4_checksum(&pkt[0..20]);
     pkt[10..12].copy_from_slice(&csum.to_be_bytes());
-    let sport: u16 = rand::thread_rng().gen_range(20000..60000);
+    let sport: u16 = rand::rng().random_range(20000..60000);
     pkt.extend_from_slice(&sport.to_be_bytes());
     pkt.extend_from_slice(&53u16.to_be_bytes());
     pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
@@ -552,9 +538,7 @@ pub async fn verify_endpoint_keep_session(
     let data_check = std::env::var("AETHER_WG_NO_DATA_CHECK").is_err();
     log::trace!("[wg] verify {} obf={} data_check={}", peer, aethernoize.is_enabled(), data_check);
 
-    let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let sock = UdpSocket::bind(bind).await?;
-    sock.connect(peer).await?;
+    let (sock, _) = crate::upstream::bind_via_upstream(peer).await?;
 
     let start = Instant::now();
     let deadline = start + timeout;
@@ -566,25 +550,31 @@ pub async fn verify_endpoint_keep_session(
     let local_secret = StaticSecret::from(private_key);
     let peer_pk = PublicKey::from(peer_public);
 
-    let mut tunn = Tunn::new(local_secret, peer_pk, None, Some(keepalive.unwrap_or(25)), 0, None)
-        .map_err(|e| AetherError::Other(format!("tunn init: {e}")))?;
+    let mut tunn = Tunn::new(local_secret, peer_pk, None, Some(keepalive.unwrap_or(25)), 0, None);
 
     let mut out_buf = vec![0u8; MAX_PACKET];
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let mut tmp_buf = vec![0u8; MAX_PACKET];
 
-    match tunn.encapsulate(&[], &mut out_buf) {
+    let init_packet = match tunn.encapsulate(&[], &mut out_buf) {
         TunnResult::WriteToNetwork(pkt) => {
             let mut pkt_vec = pkt.to_vec();
             inject_client_id(&mut pkt_vec, &client_id);
-            log::trace!("[wg] sending init {} bytes to {}", pkt_vec.len(), peer);
-            sock.send(&pkt_vec).await?;
+            pkt_vec
         }
         other => {
             log::warn!("[wg] unexpected encap result: {:?}", other);
             return Err(AetherError::Other("handshake init failed".into()));
         }
-    }
+    };
+
+    log::trace!("[wg] sending init {} bytes to {}", init_packet.len(), peer);
+    sock.send(&init_packet).await?;
+
+    let mut retry_index = 0usize;
+    let mut timer = tokio::time::interval(TIMER_TICK);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    timer.tick().await;
 
     let mut attempts = 0;
     loop {
@@ -651,6 +641,34 @@ pub async fn verify_endpoint_keep_session(
                     other => {
                         log::trace!("[wg] unexpected decap: {:?}", other);
                     }
+                }
+            }
+            _ = timer.tick() => {
+                if let Some(delay) = VERIFY_RETRY_DELAYS.get(retry_index) {
+                    if start.elapsed() >= *delay {
+                        retry_index += 1;
+                        log::trace!(
+                            "[wg] retransmitting init to {} after {:?} ({}/{})",
+                            peer,
+                            delay,
+                            retry_index,
+                            VERIFY_RETRY_DELAYS.len()
+                        );
+                        sock.send(&init_packet).await?;
+                    }
+                }
+
+                match tunn.update_timers(&mut out_buf) {
+                    TunnResult::WriteToNetwork(pkt) => {
+                        let mut pkt_vec = pkt.to_vec();
+                        inject_client_id(&mut pkt_vec, &client_id);
+                        log::trace!("[wg] timer generated {} byte handshake packet", pkt_vec.len());
+                        sock.send(&pkt_vec).await?;
+                    }
+                    TunnResult::Err(e) => {
+                        return Err(AetherError::Other(format!("wireguard timer failed: {e:?}")));
+                    }
+                    _ => {}
                 }
             }
             _ = tokio::time::sleep(remaining) => {
@@ -810,5 +828,42 @@ mod tests {
                 "{kind:?} should be fatal"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn endpoint_verification_retransmits_a_lost_initial_handshake() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = server.local_addr().unwrap();
+        let profile = aethernoize::from_profile("off");
+        let verifier = tokio::spawn(async move {
+            verify_endpoint(
+                peer,
+                [7u8; 32],
+                [9u8; 32],
+                [1u8, 2, 3],
+                "172.16.0.2".parse().unwrap(),
+                &profile,
+                Duration::from_secs(4),
+                None,
+            )
+            .await
+        });
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 2048];
+        for _ in 0..3 {
+            let n = tokio::time::timeout(Duration::from_secs(3), server.recv(&mut buf))
+                .await
+                .expect("handshake packet deadline")
+                .expect("handshake packet");
+            received.push(buf[..n].to_vec());
+        }
+
+        verifier.abort();
+        let _ = verifier.await;
+
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0], received[1]);
+        assert_eq!(received[1], received[2]);
     }
 }

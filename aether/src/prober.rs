@@ -4,20 +4,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::error::{AetherError, Result};
 use crate::noize::NoizeConfig;
 use crate::quic;
 
+pub const MASQUE_DOCUMENTED_CIDRS_V4: &[&str] = &["162.159.197.0/24", "162.159.198.0/24"];
+
+pub const MASQUE_DOH_CIDRS_V4: &[&str] = &["162.159.36.0/24", "162.159.46.0/24"];
+
 pub const MASQUE_CIDRS_V4: &[&str] = &[
-    "162.159.197.0/24",
-    "162.159.198.0/24",
     "162.159.196.0/24",
     "162.159.195.0/24",
     "162.159.192.0/24",
     "162.159.193.0/24",
     "162.159.204.0/24",
+    "162.159.197.0/24",
+    "162.159.198.0/24",
     "172.65.251.0/24",
     "188.114.96.0/24",
     "188.114.97.0/24",
@@ -28,21 +32,21 @@ pub const MASQUE_CIDRS_V4: &[&str] = &[
 ];
 
 pub const MASQUE_SEEDS: &[&str] = &[
+    "162.159.196.1",
+    "162.159.195.1",
+    "162.159.192.1",
     "162.159.197.3",
     "162.159.197.1",
     "162.159.198.2",
     "162.159.198.1",
-    "162.159.196.1",
-    "162.159.195.1",
-    "162.159.192.1",
     "162.159.193.1",
 ];
 
 pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
-    "2606:4700:102::/48",
     "2606:4700:d0::/48",
+    "2606:4700:102::/48",
     "2606:4700:d1::/48",
 ];
 
@@ -364,6 +368,16 @@ async fn verify_one(
     timeout: Duration,
     ironclad: bool,
 ) -> Option<ProbeResult> {
+    paced_probe_start().await;
+    if !ironclad {
+        // Stage 1: cheap reachability. Hosts that answer nothing die here
+        // in ~1 RTT instead of burning a full crypto-handshake timeout.
+        let peer = SocketAddr::new(ip, port);
+        if !cheap_initial_reply(peer, crate::masque_h2::enabled(), prefilter_timeout(timeout)).await
+        {
+            return None;
+        }
+    }
     if ironclad {
         let params = crate::tunnelping::MasquePingParams {
             peer: SocketAddr::new(ip, port),
@@ -434,18 +448,27 @@ async fn verify_one(
 }
 
 fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
-    let primary = ports.first().copied().unwrap_or(443);
+    let fallback = [443u16];
+    let ports: &[u16] = if ports.is_empty() { &fallback } else { ports };
+    let primary = ports[0];
     let mut out: Vec<(IpAddr, u16)> = Vec::new();
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
+
+    let mut push = |ip: IpAddr, port: u16| {
+        if seen.insert((ip, port)) {
+            out.push((ip, port));
+        }
+    };
 
     let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
     let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
 
+    // Ordered IP list: anchors first, then the pool round-robin across
+    // CIDRs (same head order as before — the most likely responders lead).
+    let mut ips: Vec<IpAddr> = Vec::new();
     if ip.want_v4() {
         for a in &seeds {
-            if seen.insert((IpAddr::V4(*a), primary)) {
-                out.push((IpAddr::V4(*a), primary));
-            }
+            ips.push(IpAddr::V4(*a));
         }
         let cidr_hosts: Vec<Vec<Ipv4Addr>> = masque_cidrs_v4()
             .iter()
@@ -461,9 +484,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         for i in 0..max_len {
             for hosts in &cidr_hosts {
                 if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V4(*a), primary)) {
-                        out.push((IpAddr::V4(*a), primary));
-                    }
+                    ips.push(IpAddr::V4(*a));
                 }
             }
         }
@@ -471,9 +492,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
 
     if ip.want_v6() {
         for a in &seeds6 {
-            if seen.insert((IpAddr::V6(*a), primary)) {
-                out.push((IpAddr::V6(*a), primary));
-            }
+            ips.push(IpAddr::V6(*a));
         }
         let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
         let cidr6: Vec<Vec<Ipv6Addr>> = masque_cidrs_v6()
@@ -484,19 +503,30 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         for i in 0..max6 {
             for hosts in &cidr6 {
                 if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V6(*a), primary)) {
-                        out.push((IpAddr::V6(*a), primary));
-                    }
+                    ips.push(IpAddr::V6(*a));
                 }
             }
         }
     }
 
+    // Wave 0: the ordered list on rotated ports, so the scan head spreads
+    // across ports instead of hammering 443 (same shape as the WG sweep).
+    // Wave 1: every address once more on its next rotated port — a pool host
+    // that only answers off-primary is found up front instead of never.
+    let n = ports.len();
+    for wave in 0..n.min(2) {
+        for (idx, candidate_ip) in ips.iter().enumerate() {
+            // `seen` dedups; the two waves never collide for n > 1.
+            push(*candidate_ip, ports[(idx + wave) % n]);
+        }
+    }
+
+    // Anchors keep full multi-port coverage (as before).
     if ip.want_v4() {
         for a in &seeds {
             for &port in ports {
-                if port != primary && seen.insert((IpAddr::V4(*a), port)) {
-                    out.push((IpAddr::V4(*a), port));
+                if port != primary {
+                    push(IpAddr::V4(*a), port);
                 }
             }
         }
@@ -504,8 +534,8 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     if ip.want_v6() {
         for a in &seeds6 {
             for &port in ports {
-                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
-                    out.push((IpAddr::V6(*a), port));
+                if port != primary {
+                    push(IpAddr::V6(*a), port);
                 }
             }
         }
@@ -550,12 +580,12 @@ fn sample_cidr_v4(cidr: &str, n: usize) -> Vec<Ipv4Addr> {
 
     let usable = size - 2;
     let want = (n as u32).min(usable);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut chosen: HashSet<u32> = HashSet::with_capacity(want as usize);
     let mut out = Vec::with_capacity(want as usize);
 
     while (out.len() as u32) < want {
-        let off = 1 + rng.gen_range(0..usable);
+        let off = 1 + rng.random_range(0..usable);
         if chosen.insert(off) {
             out.push(Ipv4Addr::from(base + off));
         }
@@ -579,24 +609,107 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
     }
 
     let v4: Vec<(u32, u8)> = v4_cidrs.iter().filter_map(|c| parse_cidr_v4(c)).collect();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let embedded = if v4.is_empty() {
-            rng.gen::<u32>() as u128
+            rng.random::<u32>() as u128
         } else {
-            let (b, p) = v4[rng.gen_range(0..v4.len())];
+            let (b, p) = v4[rng.random_range(0..v4.len())];
             let host_bits = 32u32.saturating_sub(p as u32);
             let host = if host_bits == 0 {
                 0
             } else {
-                rng.gen::<u32>() & ((1u32 << host_bits) - 1)
+                rng.random::<u32>() & ((1u32 << host_bits) - 1)
             };
             (b | host) as u128
         };
         out.push(Ipv6Addr::from(base | embedded));
     }
     out
+}
+
+/// Cheap reachability pre-filter: one handshake-less probe before paying
+/// for a full verify. A bare QUIC Initial (or a TCP SYN in H2 mode) that
+/// gets ANY reply means someone lives there; silence means skip without
+/// burning crypto + multi-RTT handshake timeouts on a dead host.
+///
+/// Deliberately no obfuscation noise here: answering an Initial is mandatory
+/// for a real QUIC edge, and the noise sleeps would defeat the "cheap" part.
+/// The full verify that follows still decides; this only skips the silent.
+async fn cheap_initial_reply(peer: SocketAddr, h2: bool, timeout: Duration) -> bool {
+    if h2 {
+        tcp_answers(peer, timeout).await.is_some()
+    } else {
+        quic_answers(peer, timeout).await.is_some()
+    }
+}
+
+async fn quic_answers(peer: SocketAddr, timeout: Duration) -> Option<Duration> {
+    let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = tokio::net::UdpSocket::bind(bind).await.ok()?;
+    sock.connect(peer).await.ok()?;
+    let local = sock.local_addr().ok()?;
+
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
+    config.set_application_protos(&[b"h3"]).ok()?;
+    config.verify_peer(false);
+    config.set_max_idle_timeout(timeout.as_millis() as u64);
+    config.set_initial_max_data(1_000_000);
+    config.set_initial_max_stream_data_bidi_local(100_000);
+    config.set_initial_max_streams_bidi(4);
+
+    let mut scid = [0u8; 16];
+    rand::rng().fill(&mut scid[..]);
+    let scid = quiche::ConnectionId::from_ref(&scid);
+
+    let sni = crate::consts::CONNECT_SNI;
+    let mut conn = quiche::connect(Some(sni), &scid, local, peer, &mut config).ok()?;
+
+    let mut out = [0u8; 1350];
+    let (written, _) = conn.send(&mut out).ok()?;
+
+    let started = Instant::now();
+    sock.send(&out[..written]).await.ok()?;
+
+    let mut buf = [0u8; 1500];
+    match tokio::time::timeout(timeout, sock.recv(&mut buf)).await {
+        Ok(Ok(read)) if read > 0 => Some(started.elapsed()),
+        _ => None,
+    }
+}
+
+async fn tcp_answers(peer: SocketAddr, timeout: Duration) -> Option<Duration> {
+    let started = Instant::now();
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(peer)).await {
+        Ok(Ok(_)) => Some(started.elapsed()),
+        _ => None,
+    }
+}
+
+/// Stage-1 budget: long enough for a slow round trip, short enough to keep
+/// the filter cheap. Pure, tested.
+fn prefilter_timeout(full: Duration) -> Duration {
+    full.div_f32(2.0).clamp(Duration::from_secs(2), Duration::from_secs(5))
+}
+
+/// Inter-probe pacing (burst smoothing for hostile networks).
+/// `AETHER_PROBE_JITTER_MS` = max random delay per probe, 0 = unchanged.
+async fn probe_pacing() {
+    let max_ms: u64 = std::env::var("AETHER_PROBE_JITTER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    if max_ms > 0 {
+        let ms = rand::rng().random_range(0..=max_ms);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
+}
+
+pub(crate) async fn paced_probe_start() {
+    probe_pacing().await;
 }
 
 #[cfg(test)]
@@ -610,17 +723,10 @@ mod tests {
     }
 
     #[test]
-    fn the_documented_masque_ingress_range_is_swept_first() {
-        assert_eq!(MASQUE_CIDRS_V4.first(), Some(&"162.159.197.0/24"));
-        assert_eq!(MASQUE_CIDRS_V6.first(), Some(&"2606:4700:102::/48"));
-    }
-
-    #[test]
     fn the_dns_over_https_ranges_are_swept_last_because_they_never_serve_masque() {
-        let doh = ["162.159.36.0/24", "162.159.46.0/24"];
-        let tail = &MASQUE_CIDRS_V4[MASQUE_CIDRS_V4.len() - doh.len()..];
-        for entry in doh {
-            assert!(tail.contains(&entry), "{entry} should be at the end");
+        let tail = &MASQUE_CIDRS_V4[MASQUE_CIDRS_V4.len() - MASQUE_DOH_CIDRS_V4.len()..];
+        for entry in MASQUE_DOH_CIDRS_V4 {
+            assert!(tail.contains(entry), "{entry} should be at the end");
         }
     }
 
@@ -632,11 +738,6 @@ mod tests {
     #[test]
     fn the_documented_masque_fallback_ports_keep_their_documented_order() {
         assert_eq!(MASQUE_PORTS, &[443, 500, 1701, 4500, 4443, 8443, 8095]);
-    }
-
-    #[test]
-    fn a_live_documented_address_is_the_first_seed() {
-        assert_eq!(MASQUE_SEEDS.first(), Some(&"162.159.197.3"));
     }
 
     #[test]
@@ -669,6 +770,304 @@ mod tests {
                 "documented fallback port {port} should be scanned"
             );
         }
+    }
+
+    async fn first_answer(
+        targets: &[SocketAddr],
+        timeout: Duration,
+        attempts: u32,
+        udp: bool,
+    ) -> Option<(SocketAddr, Duration)> {
+        for _ in 0..attempts {
+            let probes = targets.iter().copied().map(|peer| async move {
+                let rtt = match udp {
+                    true => quic_answers(peer, timeout).await,
+                    false => tcp_answers(peer, timeout).await,
+                };
+                (peer, rtt)
+            });
+
+            let results: Vec<(SocketAddr, Option<Duration>)> = futures::stream::iter(probes)
+                .buffer_unordered(targets.len().max(1))
+                .collect()
+                .await;
+
+            if let Some((peer, Some(rtt))) = results.into_iter().find(|(_, rtt)| rtt.is_some()) {
+                return Some((peer, rtt));
+            }
+        }
+        None
+    }
+
+    fn hosts_of(cidr: &str, tails: &[u8]) -> Vec<Ipv4Addr> {
+        let base: Ipv4Addr = cidr.split('/').next().unwrap().parse().expect("cidr base");
+        let octets = base.octets();
+        tails
+            .iter()
+            .map(|tail| Ipv4Addr::new(octets[0], octets[1], octets[2], *tail))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "probes the live cloudflare edge from this network to see which masque ranges answer"]
+    async fn report_which_masque_ranges_answer_on_this_network() {
+        const TAILS: &[u8] = &[1, 2, 3];
+
+        let timeout = Duration::from_millis(
+            std::env::var("AETHER_PROBE_TIMEOUT_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .unwrap_or(10_000),
+        );
+
+        let attempts = std::env::var("AETHER_PROBE_ATTEMPTS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(2);
+
+        let ports: Vec<u16> = match std::env::var("AETHER_PROBE_PORTS") {
+            Ok(raw) => raw
+                .split(',')
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .collect(),
+            Err(_) => vec![443],
+        };
+        let ports = if ports.is_empty() { vec![443] } else { ports };
+
+        println!();
+        println!("probing the masque ranges from this network");
+        println!("  udp timeout {timeout:?}, {attempts} attempt(s), hosts {TAILS:?}");
+        println!("  udp ports {ports:?}");
+        println!("  override: AETHER_PROBE_TIMEOUT_MS, AETHER_PROBE_ATTEMPTS, AETHER_PROBE_PORTS");
+        println!();
+
+        let control: Vec<SocketAddr> = vec![
+            "1.1.1.1:443".parse().unwrap(),
+            "8.8.8.8:443".parse().unwrap(),
+        ];
+
+        let control_quic = first_answer(&control, timeout, attempts, true).await;
+        let control_tcp = first_answer(&control, timeout, attempts, false).await;
+
+        println!("control targets (public resolvers, not cloudflare warp edges)");
+        match control_quic {
+            Some((peer, rtt)) => println!("  quic/udp 443 works: {peer} in {}ms", rtt.as_millis()),
+            None => println!("  quic/udp 443 got no answer at all"),
+        }
+        match control_tcp {
+            Some((peer, rtt)) => println!("  tcp 443 works:      {peer} in {}ms", rtt.as_millis()),
+            None => println!("  tcp 443 got no answer at all"),
+        }
+        println!();
+
+        let mut udp_ok = Vec::new();
+        let mut tcp_only = Vec::new();
+        let mut silent = Vec::new();
+
+        for cidr in MASQUE_CIDRS_V4 {
+            let note = if MASQUE_DOCUMENTED_CIDRS_V4.contains(cidr) {
+                " [documented]"
+            } else if MASQUE_DOH_CIDRS_V4.contains(cidr) {
+                " [dns-over-https]"
+            } else {
+                ""
+            };
+
+            let hosts = hosts_of(cidr, TAILS);
+
+            let mut udp_hit: Option<(SocketAddr, Duration)> = None;
+            for port in &ports {
+                let targets: Vec<SocketAddr> = hosts
+                    .iter()
+                    .map(|ip| SocketAddr::new(IpAddr::V4(*ip), *port))
+                    .collect();
+                udp_hit = first_answer(&targets, timeout, attempts, true).await;
+                if udp_hit.is_some() {
+                    break;
+                }
+            }
+
+            let tcp_targets: Vec<SocketAddr> = hosts
+                .iter()
+                .map(|ip| SocketAddr::new(IpAddr::V4(*ip), 443))
+                .collect();
+            let tcp_hit = first_answer(&tcp_targets, timeout, attempts, false).await;
+
+            match (udp_hit, tcp_hit) {
+                (Some((peer, rtt)), _) => {
+                    println!("  UDP OK    {cidr}{note}  {peer} in {}ms", rtt.as_millis());
+                    udp_ok.push(*cidr);
+                }
+                (None, Some((peer, rtt))) => {
+                    println!(
+                        "  TCP ONLY  {cidr}{note}  {peer} in {}ms, udp stayed silent",
+                        rtt.as_millis()
+                    );
+                    tcp_only.push(*cidr);
+                }
+                (None, None) => {
+                    println!("  SILENT    {cidr}{note}");
+                    silent.push(*cidr);
+                }
+            }
+        }
+
+        println!();
+        println!("masque over quic works on ({}):", udp_ok.len());
+        for cidr in &udp_ok {
+            println!("  {cidr}");
+        }
+        println!();
+        println!("reachable over tcp only ({}):", tcp_only.len());
+        for cidr in &tcp_only {
+            println!("  {cidr}");
+        }
+        println!();
+        println!("no answer on either ({}):", silent.len());
+        for cidr in &silent {
+            println!("  {cidr}");
+        }
+
+        println!();
+        println!("verdict");
+        if !udp_ok.is_empty() {
+            println!("  put these ranges first in MASQUE_CIDRS_V4: {udp_ok:?}");
+        } else if control_quic.is_none() {
+            println!("  this network answers no quic at all, not even a public resolver,");
+            println!("  so udp 443 is blocked here rather than these ranges being blocked.");
+            println!("  reordering MASQUE_CIDRS_V4 cannot help; masque needs its http/2");
+            println!("  fallback over tcp 443 (--masque-http2) on this network.");
+        } else {
+            println!("  quic works to other hosts but every warp range stayed silent,");
+            println!("  so these ranges really are filtered here.");
+            if !tcp_only.is_empty() {
+                println!("  the tcp-only ranges above can still carry masque over http/2.");
+            }
+        }
+        println!();
+    }
+
+    #[test]
+    fn anchors_still_lead_in_position_with_spread_ports() {
+        let st = ScanMode::Turbo.strategy();
+        let ports = [443u16, 500, 1701];
+        let out = build_candidates(&st, &ports, IpScan::V4);
+        for (idx, seed) in MASQUE_SEEDS.iter().enumerate() {
+            let ip = IpAddr::V4(seed.parse().expect("seed"));
+            assert_eq!(out[idx].0, ip, "anchor {ip} must keep its lead position");
+            assert_eq!(
+                out[idx].1,
+                ports[idx % ports.len()],
+                "anchor ports must rotate, not stack on 443"
+            );
+        }
+        let head: HashSet<u16> = out[..ports.len()].iter().map(|(_, p)| *p).collect();
+        assert_eq!(head.len(), ports.len(), "scan head must spread across ports");
+    }
+
+    #[test]
+    fn pool_hosts_get_a_rotated_alternate_port_up_front() {
+        let st = ScanMode::Turbo.strategy();
+        let ports = [443u16, 500, 1701];
+        let out = build_candidates(&st, &ports, IpScan::V4);
+        // First pool IP sits right after the anchors.
+        let pool_ip = out[MASQUE_SEEDS.len()].0;
+        let hits: Vec<u16> = out
+            .iter()
+            .filter(|(ip, _)| *ip == pool_ip)
+            .map(|(_, p)| *p)
+            .collect();
+        assert!(hits.contains(&443), "pool host must still be tried on 443");
+        assert!(
+            hits.iter().any(|p| *p != 443),
+            "pool host {pool_ip} must also be tried off-primary without waiting for the tail"
+        );
+        let first_alt = out
+            .iter()
+            .position(|(ip, p)| *ip == pool_ip && *p != 443)
+            .unwrap();
+        assert!(
+            first_alt < 2 * (MASQUE_SEEDS.len() + 64),
+            "alternate-port attempt must land in the first two waves"
+        );
+    }
+
+    #[test]
+    fn candidate_list_has_no_duplicates() {
+        let st = ScanMode::Balanced.strategy();
+        let out = build_candidates(&st, MASQUE_PORTS, IpScan::V4);
+        let mut seen = HashSet::new();
+        for c in &out {
+            assert!(seen.insert(*c), "duplicate candidate {c:?}");
+        }
+    }
+
+    #[test]
+    fn empty_port_list_falls_back_to_443() {
+        let st = ScanMode::Turbo.strategy();
+        let out = build_candidates(&st, &[], IpScan::V4);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|(_, p)| *p == 443));
+    }
+
+    #[test]
+    fn prefilter_budget_covers_slow_round_trips_but_stays_cheap() {
+        assert_eq!(prefilter_timeout(Duration::from_secs(6)), Duration::from_secs(3));
+        assert_eq!(prefilter_timeout(Duration::from_secs(5)), Duration::from_millis(2500));
+        // Never shorter than one slow RTT, never pricier than a quick check.
+        assert_eq!(prefilter_timeout(Duration::from_secs(60)), Duration::from_secs(5));
+        assert_eq!(prefilter_timeout(Duration::from_millis(500)), Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn pacing_defaults_to_zero_delay() {
+        std::env::remove_var("AETHER_PROBE_JITTER_MS");
+        let start = Instant::now();
+        paced_probe_start().await;
+        assert!(start.elapsed() < Duration::from_secs(1));
+        std::env::set_var("AETHER_PROBE_JITTER_MS", "bogus");
+        paced_probe_start().await;
+        std::env::remove_var("AETHER_PROBE_JITTER_MS");
+    }
+
+    #[tokio::test]
+    async fn cheap_filter_passes_a_talker_and_drops_silence() {
+        // UDP responder on loopback: any reply counts as "someone lives here".
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, peer)) = udp.recv_from(&mut buf).await {
+                let _ = udp.send_to(&buf[..n.min(64)], peer).await;
+            }
+        });
+        assert!(
+            cheap_initial_reply(udp_addr, false, Duration::from_secs(3)).await,
+            "a replying UDP socket must pass the filter"
+        );
+        // TCP listener on loopback for the H2-mode branch.
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = tcp.accept().await;
+        });
+        assert!(
+            cheap_initial_reply(tcp_addr, true, Duration::from_secs(3)).await,
+            "an open TCP port must pass the filter"
+        );
+        // Closed ports stay silent on loopback: ICMP refused / RST.
+        let dead_udp: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            !cheap_initial_reply(dead_udp, false, Duration::from_secs(2)).await,
+            "a silent UDP port must be filtered out"
+        );
+        let dead_tcp: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            !cheap_initial_reply(dead_tcp, true, Duration::from_secs(2)).await,
+            "a closed TCP port must be filtered out"
+        );
     }
 
     #[test]

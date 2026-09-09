@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::{AetherError, Result};
-use crate::fragment::{FragmentConfig, FragmentingStream};
+use crate::fragment::{FragmentConfig, FragmentingStream, MaskMode};
 
 const EDGE_PREFIX: [u8; 3] = [141, 101, 113];
 const EDGE_SAMPLES: usize = 3;
@@ -59,6 +59,7 @@ impl Fingerprint {
         match self {
             Fingerprint::SplitLegacy => FragmentConfig {
                 enabled: true,
+                mode: MaskMode::LegacyTcpFragment,
                 size_min: 24,
                 size_max: 48,
                 delay_min_ms: 2,

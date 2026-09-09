@@ -18,22 +18,19 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
           p = Path('aether/src/apifront.rs')
           s = p.read_text()
           old_import = 'use crate::fragment::{FragmentConfig, FragmentingStream};'
           new_import = 'use crate::fragment::{FragmentConfig, FragmentingStream, MaskMode};'
-          old_cfg = '''Fingerprint::SplitLegacy => FragmentConfig {
-                enabled: true,
-                size_min: 24,'''
-          new_cfg = '''Fingerprint::SplitLegacy => FragmentConfig {
-                enabled: true,
-                mode: MaskMode::LegacyTcpFragment,
-                size_min: 24,'''
           if s.count(old_import) != 1:
               raise SystemExit('unexpected FragmentConfig import shape')
-          if s.count(old_cfg) != 1:
+          s = s.replace(old_import, new_import)
+          pattern = r'(Fingerprint::SplitLegacy\s*=>\s*FragmentConfig\s*\{\s*enabled:\s*true,\s*)(size_min:\s*24,)'
+          s, count = re.subn(pattern, r'\1mode: MaskMode::LegacyTcpFragment,\n                \2', s, count=1)
+          if count != 1:
               raise SystemExit('unexpected SplitLegacy FragmentConfig shape')
-          p.write_text(s.replace(old_import, new_import).replace(old_cfg, new_cfg))
+          p.write_text(s)
           PY
       - name: Check Core
         run: cargo check --manifest-path aether/Cargo.toml

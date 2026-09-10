@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rand::{RngExt, Rng};
+use rand::{Rng, RngExt};
 use regex::Regex;
 use tokio::net::UdpSocket;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AetherNoizeConfig {
     pub i1: Option<String>,
     pub i2: Option<String>,
@@ -43,6 +43,9 @@ impl AetherNoizeConfig {
         }
     }
 
+    // Preserve the established WireGuard profiles exactly. The new firewall and
+    // gfw profiles are added around these known-good wire shapes rather than
+    // mutating fingerprints existing users may already depend on.
     pub fn light() -> Self {
         Self {
             i1: Some("<b 0d0a0d0a><t><r 20-32>".to_string()),
@@ -62,6 +65,28 @@ impl AetherNoizeConfig {
         }
     }
 
+    /// Conservative profile for restrictive firewalls. Historically this name
+    /// fell through to balanced; it now has its own lower-volume signature and
+    /// timing distribution without changing the balanced default.
+    pub fn firewall() -> Self {
+        Self {
+            i1: Some("<b 0d0a0d0a><t><n><r 20-32>".to_string()),
+            i2: Some("<rc 28-52>".to_string()),
+            i3: Some("<rd 12-20>".to_string()),
+            i4: None,
+            i5: None,
+            jc: 5,
+            jc_before_hs: 2,
+            jc_after_i1: 2,
+            jc_after_hs: 1,
+            jmin: 56,
+            jmax: 224,
+            junk_interval: Duration::from_millis(4),
+            handshake_delay: Duration::from_millis(6),
+            allow_zero_size: false,
+        }
+    }
+
     pub fn balanced() -> Self {
         Self {
             i1: Some("<b 0d0a0d0a><t><rc 20-40>".to_string()),
@@ -77,6 +102,28 @@ impl AetherNoizeConfig {
             jmax: 256,
             junk_interval: Duration::from_millis(2),
             handshake_delay: Duration::from_millis(8),
+            allow_zero_size: false,
+        }
+    }
+
+    /// A distinct censorship-focused profile. Historically `gfw` was another
+    /// spelling of balanced; keeping balanced stable while adding a separate
+    /// shape gives route recovery a genuinely different candidate to try.
+    pub fn gfw() -> Self {
+        Self {
+            i1: Some("<n><t><rc 32-56>".to_string()),
+            i2: Some("<b 504f5354><rd 12-24><rc 28-44>".to_string()),
+            i3: Some("<b 47455420><rc 28-48>".to_string()),
+            i4: Some("<r 48-80>".to_string()),
+            i5: None,
+            jc: 8,
+            jc_before_hs: 3,
+            jc_after_i1: 3,
+            jc_after_hs: 2,
+            jmin: 72,
+            jmax: 320,
+            junk_interval: Duration::from_millis(5),
+            handshake_delay: Duration::from_millis(10),
             allow_zero_size: false,
         }
     }
@@ -106,9 +153,12 @@ impl AetherNoizeConfig {
 }
 
 pub fn from_profile(name: &str) -> AetherNoizeConfig {
-    match name {
+    match name.trim().to_ascii_lowercase().as_str() {
         "off" | "none" => AetherNoizeConfig::off(),
         "light" => AetherNoizeConfig::light(),
+        "firewall" => AetherNoizeConfig::firewall(),
+        "balanced" => AetherNoizeConfig::balanced(),
+        "gfw" => AetherNoizeConfig::gfw(),
         "aggressive" | "heavy" => AetherNoizeConfig::aggressive(),
         _ => AetherNoizeConfig::balanced(),
     }
@@ -119,8 +169,12 @@ fn parse_range(data: &str) -> usize {
     if let (Some(min_str), Some(max_str)) = (parts.next(), parts.next()) {
         let min: usize = min_str.trim().parse().unwrap_or(0);
         let max: usize = max_str.trim().parse().unwrap_or(0);
-        if max > min && min > 0 {
-            return rand::rng().random_range(min..=max).min(2048);
+        if max >= min && min > 0 {
+            return if max == min {
+                min.min(2048)
+            } else {
+                rand::rng().random_range(min..=max).min(2048)
+            };
         }
     }
     data.trim().parse().unwrap_or(0).min(2048)
@@ -163,6 +217,10 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
                     .unwrap_or(0)
                     % 0xFFFFFFFF) as u32;
                 out.extend_from_slice(&counter.to_be_bytes());
+            }
+            "n" => {
+                let nonce: u64 = rand::random();
+                out.extend_from_slice(&nonce.to_be_bytes());
             }
             "r" => {
                 let len = parse_range(tag_data);
@@ -276,6 +334,9 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
         return;
     }
 
+    // Preserve the established AetherNoize wire ordering. The field names
+    // predate this sender layout and changing the sequence would alter the
+    // on-wire fingerprint of existing profiles.
     if let Some(ref i1) = cfg.i1 {
         let payload = parse_cps(i1);
         if !payload.is_empty() {
@@ -349,5 +410,104 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
         if !gap.is_zero() {
             tokio::time::sleep(gap).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_profiles() -> [AetherNoizeConfig; 6] {
+        [
+            from_profile("off"),
+            from_profile("light"),
+            from_profile("firewall"),
+            from_profile("balanced"),
+            from_profile("gfw"),
+            from_profile("aggressive"),
+        ]
+    }
+
+    #[test]
+    fn every_profile_the_app_offers_maps_to_a_distinct_config() {
+        let profiles = app_profiles();
+        for left in 0..profiles.len() {
+            for right in (left + 1)..profiles.len() {
+                assert_ne!(
+                    profiles[left], profiles[right],
+                    "profiles at indexes {left} and {right} unexpectedly alias"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn established_wireguard_profiles_keep_their_wire_settings() {
+        let light = from_profile("light");
+        assert_eq!(light.jc, 4);
+        assert_eq!(light.jmax, 190);
+        assert_eq!(light.i1.as_deref(), Some("<b 0d0a0d0a><t><r 20-32>"));
+
+        let balanced = from_profile("balanced");
+        assert_eq!(balanced.jc, 6);
+        assert_eq!(balanced.jmax, 256);
+        assert_eq!(balanced.handshake_delay, Duration::from_millis(8));
+        assert_eq!(
+            balanced.i2.as_deref(),
+            Some("<b 504f5354><rd 10-20><rc 20-30>")
+        );
+
+        let aggressive = from_profile("aggressive");
+        assert_eq!(aggressive.jc, 10);
+        assert_eq!(aggressive.jmax, 384);
+        assert_eq!(aggressive.handshake_delay, Duration::from_millis(12));
+        assert_eq!(
+            aggressive.i1.as_deref(),
+            Some("<b 0d0a0d0a><t><rc 40-64>")
+        );
+    }
+
+    #[test]
+    fn junk_count_matches_each_profile_stage_budget() {
+        for cfg in app_profiles() {
+            assert_eq!(
+                cfg.jc,
+                cfg.jc_before_hs + cfg.jc_after_i1 + cfg.jc_after_hs
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_profiles_generate_only_bounded_nonempty_junk() {
+        for cfg in app_profiles()
+            .into_iter()
+            .filter(AetherNoizeConfig::is_enabled)
+        {
+            for _ in 0..16 {
+                let junk = generate_junk(&cfg);
+                assert!(!junk.is_empty());
+                assert!((cfg.jmin..=cfg.jmax).contains(&junk.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn cps_nonce_and_random_ranges_are_bounded() {
+        for _ in 0..32 {
+            let packet = parse_cps("<n><r 12-20>");
+            assert!((20..=28).contains(&packet.len()));
+        }
+    }
+
+    #[test]
+    fn aliases_and_case_normalization_remain_compatible() {
+        assert_eq!(from_profile("none"), from_profile("off"));
+        assert_eq!(from_profile("heavy"), from_profile("aggressive"));
+        assert_eq!(from_profile(" GFW "), from_profile("gfw"));
+    }
+
+    #[test]
+    fn unknown_profile_keeps_the_wireguard_balanced_default() {
+        assert_eq!(from_profile("something-else"), from_profile("balanced"));
     }
 }

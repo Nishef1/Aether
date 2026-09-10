@@ -43,6 +43,9 @@ impl AetherNoizeConfig {
         }
     }
 
+    // Preserve the established WireGuard profiles exactly. The new firewall and
+    // gfw profiles are added around these known-good wire shapes rather than
+    // mutating fingerprints existing users may already depend on.
     pub fn light() -> Self {
         Self {
             i1: Some("<b 0d0a0d0a><t><r 20-32>".to_string()),
@@ -62,8 +65,9 @@ impl AetherNoizeConfig {
         }
     }
 
-    /// Conservative profile for restrictive firewalls. It deliberately keeps
-    /// fewer/lower-volume signatures than balanced while no longer aliasing it.
+    /// Conservative profile for restrictive firewalls. Historically this name
+    /// fell through to balanced; it now has its own lower-volume signature and
+    /// timing distribution without changing the balanced default.
     pub fn firewall() -> Self {
         Self {
             i1: Some("<b 0d0a0d0a><t><n><r 20-32>".to_string()),
@@ -102,9 +106,9 @@ impl AetherNoizeConfig {
         }
     }
 
-    /// Censorship-focused profile with a separate signature/timing family.
-    /// Keeping it distinct from both balanced and aggressive gives retry logic
-    /// another genuinely different shape to test on filtered networks.
+    /// A distinct censorship-focused profile. Historically `gfw` was another
+    /// spelling of balanced; keeping balanced stable while adding a separate
+    /// shape gives route recovery a genuinely different candidate to try.
     pub fn gfw() -> Self {
         Self {
             i1: Some("<n><t><rc 32-56>".to_string()),
@@ -126,7 +130,7 @@ impl AetherNoizeConfig {
 
     pub fn aggressive() -> Self {
         Self {
-            i1: Some("<n><b 0d0a0d0a><t><rc 40-64>".to_string()),
+            i1: Some("<b 0d0a0d0a><t><rc 40-64>".to_string()),
             i2: Some("<b 504f5354><t><rd 15-30><rc 30-50>".to_string()),
             i3: Some("<b 474554><rc 40-60>".to_string()),
             i4: Some("<r 60-100>".to_string()),
@@ -435,6 +439,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn established_wireguard_profiles_keep_their_wire_settings() {
+        let light = from_profile("light");
+        assert_eq!(light.jc, 4);
+        assert_eq!(light.jmax, 190);
+        assert_eq!(light.i1.as_deref(), Some("<b 0d0a0d0a><t><r 20-32>"));
+
+        let balanced = from_profile("balanced");
+        assert_eq!(balanced.jc, 6);
+        assert_eq!(balanced.jmax, 256);
+        assert_eq!(balanced.handshake_delay, Duration::from_millis(8));
+        assert_eq!(
+            balanced.i2.as_deref(),
+            Some("<b 504f5354><rd 10-20><rc 20-30>")
+        );
+
+        let aggressive = from_profile("aggressive");
+        assert_eq!(aggressive.jc, 10);
+        assert_eq!(aggressive.jmax, 384);
+        assert_eq!(aggressive.handshake_delay, Duration::from_millis(12));
+        assert_eq!(
+            aggressive.i1.as_deref(),
+            Some("<b 0d0a0d0a><t><rc 40-64>")
+        );
     }
 
     #[test]

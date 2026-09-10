@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rand::RngExt;
 use rand::Rng;
+use rand::RngExt;
 use tokio::net::UdpSocket;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoizeConfig {
     pub jc_before_hs: usize,
     pub jc_after_i1: usize,
@@ -29,39 +29,72 @@ impl NoizeConfig {
         }
     }
 
-    pub fn firewall() -> Self {
-        Self {
-            jc_before_hs: 2,
-            jc_after_i1: 2,
-            jmin: 48,
-            jmax: 190,
-            i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
-            i2: Some("<r 48>".to_string()),
-            junk_interval: Duration::from_millis(4),
-        }
-    }
-
     pub fn light() -> Self {
         Self {
             jc_before_hs: 1,
             jc_after_i1: 0,
             jmin: 32,
             jmax: 96,
-            i1: Some("<b 0d0a0d0a><t><r 16>".to_string()),
+            i1: Some("<b 0d0a0d0a><t><r 12-20>".to_string()),
             i2: None,
             junk_interval: Duration::from_millis(3),
         }
     }
 
-    pub fn gfw() -> Self {
+    /// Conservative MASQUE cover traffic for ordinary restrictive firewalls.
+    /// Keep this as the MASQUE default: it adds diversity without the larger
+    /// burst sizes used by the censorship-focused profiles.
+    pub fn firewall() -> Self {
         Self {
             jc_before_hs: 2,
             jc_after_i1: 1,
-            jmin: 64,
-            jmax: 256,
-            i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
-            i2: Some("<r 32>".to_string()),
+            jmin: 48,
+            jmax: 176,
+            i1: Some("<b 0d0a0d0a><t><n><r 16-28>".to_string()),
+            i2: Some("<r 32-56>".to_string()),
+            junk_interval: Duration::from_millis(4),
+        }
+    }
+
+    /// General-purpose profile with wider packet-size variance than firewall.
+    pub fn balanced() -> Self {
+        Self {
+            jc_before_hs: 2,
+            jc_after_i1: 2,
+            jmin: 56,
+            jmax: 224,
+            i1: Some("<t><n><r 20-36>".to_string()),
+            i2: Some("<b 504f5354><r 40-64>".to_string()),
+            junk_interval: Duration::from_millis(3),
+        }
+    }
+
+    /// Heavier profile intended for networks doing aggressive UDP/DPI filtering.
+    /// It intentionally uses a different signature family and slower spacing
+    /// instead of being an alias for `aggressive`.
+    pub fn gfw() -> Self {
+        Self {
+            jc_before_hs: 3,
+            jc_after_i1: 2,
+            jmin: 72,
+            jmax: 320,
+            i1: Some("<n><t><r 28-52>".to_string()),
+            i2: Some("<b 47455420><n><r 48-80>".to_string()),
             junk_interval: Duration::from_millis(5),
+        }
+    }
+
+    /// Maximum built-in MASQUE cover traffic. This remains opt-in because the
+    /// extra packets and delay can cost battery and connection setup time.
+    pub fn aggressive() -> Self {
+        Self {
+            jc_before_hs: 4,
+            jc_after_i1: 3,
+            jmin: 88,
+            jmax: 448,
+            i1: Some("<n><t><r 40-72>".to_string()),
+            i2: Some("<b 504f5354><n><r 72-112>".to_string()),
+            junk_interval: Duration::from_millis(2),
         }
     }
 
@@ -71,12 +104,31 @@ impl NoizeConfig {
 }
 
 pub fn from_profile(name: &str) -> NoizeConfig {
-    match name {
+    match name.trim().to_ascii_lowercase().as_str() {
         "off" | "none" => NoizeConfig::off(),
         "light" => NoizeConfig::light(),
-        "gfw" | "aggressive" | "heavy" => NoizeConfig::gfw(),
+        "firewall" => NoizeConfig::firewall(),
+        "balanced" => NoizeConfig::balanced(),
+        "gfw" => NoizeConfig::gfw(),
+        "aggressive" | "heavy" => NoizeConfig::aggressive(),
         _ => NoizeConfig::firewall(),
     }
+}
+
+fn parse_range(data: &str) -> usize {
+    let mut parts = data.split('-');
+    if let (Some(min_str), Some(max_str)) = (parts.next(), parts.next()) {
+        let min: usize = min_str.trim().parse().unwrap_or(0);
+        let max: usize = max_str.trim().parse().unwrap_or(0);
+        if max >= min && min > 0 {
+            return if max == min {
+                min.min(2048)
+            } else {
+                rand::rng().random_range(min..=max).min(2048)
+            };
+        }
+    }
+    data.trim().parse().unwrap_or(0).min(2048)
 }
 
 fn junk_packet(cfg: &NoizeConfig) -> Vec<u8> {
@@ -116,27 +168,27 @@ fn parse_cps(spec: &str) -> Vec<u8> {
                 if let Ok(decoded) = hex::decode(&hexstr) {
                     out.extend_from_slice(&decoded);
                 }
-            },
+            }
             "t" => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as u32)
                     .unwrap_or(0);
                 out.extend_from_slice(&ts.to_be_bytes());
-            },
+            }
             "n" => {
                 let nonce: u64 = rand::random();
                 out.extend_from_slice(&nonce.to_be_bytes());
-            },
+            }
             "r" => {
-                let len: usize = data.parse().unwrap_or(0).min(1024);
+                let len = parse_range(data);
                 if len > 0 {
                     let mut r = vec![0u8; len];
                     rand::rng().fill_bytes(&mut r);
                     out.extend_from_slice(&r);
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
 
         i = end + 1;
@@ -201,44 +253,57 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
 mod tests {
     use super::*;
 
+    fn app_profiles() -> [NoizeConfig; 6] {
+        [
+            from_profile("off"),
+            from_profile("light"),
+            from_profile("firewall"),
+            from_profile("balanced"),
+            from_profile("gfw"),
+            from_profile("aggressive"),
+        ]
+    }
+
     #[test]
     fn every_profile_the_app_offers_maps_to_a_distinct_config() {
-        let off = from_profile("off");
-        let light = from_profile("light");
-        let balanced = from_profile("balanced");
-        let aggressive = from_profile("aggressive");
-
-        assert!(!off.is_enabled());
-        assert!(light.is_enabled());
-        assert!(balanced.is_enabled());
-        assert!(aggressive.is_enabled());
-
-        assert_ne!(light.jmax, balanced.jmax);
-        assert_ne!(balanced.jmax, aggressive.jmax);
+        let profiles = app_profiles();
+        for left in 0..profiles.len() {
+            for right in (left + 1)..profiles.len() {
+                assert_ne!(
+                    profiles[left], profiles[right],
+                    "profiles at indexes {left} and {right} unexpectedly alias"
+                );
+            }
+        }
     }
 
     #[test]
-    fn noise_grows_with_the_profile_level() {
-        let light = from_profile("light");
-        let balanced = from_profile("balanced");
-        let aggressive = from_profile("aggressive");
-
-        assert!(light.jmax < balanced.jmax);
-        assert!(balanced.jmax < aggressive.jmax);
+    fn every_enabled_profile_has_bounded_random_cover_traffic() {
+        for cfg in app_profiles().into_iter().filter(NoizeConfig::is_enabled) {
+            assert!(cfg.jmin > 0);
+            assert!(cfg.jmax >= cfg.jmin);
+            let packet = junk_packet(&cfg);
+            assert!((cfg.jmin..=cfg.jmax).contains(&packet.len()));
+        }
     }
 
     #[test]
-    fn the_legacy_profile_names_still_work() {
-        assert_eq!(from_profile("firewall").jmax, from_profile("balanced").jmax);
-        assert_eq!(from_profile("gfw").jmax, from_profile("aggressive").jmax);
-        assert!(!from_profile("none").is_enabled());
+    fn cps_random_ranges_are_bounded() {
+        for _ in 0..32 {
+            let packet = parse_cps("<b 0102><r 12-20>");
+            assert!((14..=22).contains(&packet.len()));
+        }
     }
 
     #[test]
-    fn an_unknown_profile_falls_back_to_the_balanced_default() {
-        assert_eq!(
-            from_profile("something-else").jmax,
-            from_profile("balanced").jmax
-        );
+    fn aliases_and_case_normalization_remain_compatible() {
+        assert_eq!(from_profile("none"), from_profile("off"));
+        assert_eq!(from_profile("heavy"), from_profile("aggressive"));
+        assert_eq!(from_profile(" GFW "), from_profile("gfw"));
+    }
+
+    #[test]
+    fn unknown_profile_keeps_the_masque_firewall_default() {
+        assert_eq!(from_profile("something-else"), from_profile("firewall"));
     }
 }

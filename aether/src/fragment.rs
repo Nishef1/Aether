@@ -7,17 +7,21 @@ use std::time::Duration;
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+const PATTERNIHA_TLS_FIRST_PAYLOAD: usize = 104;
+const PATTERNIHA_TCP_FIRST_WRITE: usize = 114;
+const PATTERNIHA_TCP_MAX_SPLITS: usize = 11;
+const PATTERNIHA_TCP_DELAY_MS: u64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskMode {
     Off,
     LegacyTcpFragment,
-    /// Best-effort deterministic TCP write boundaries over the cleartext TLS
-    /// ClientHello. This does not rewrite TLS records; it only controls how
-    /// bytes offered by the TLS implementation are forwarded to the socket.
+    /// Deterministic TCP write boundaries during the ClientHello phase. This
+    /// compatibility mode does not rewrite TLS record headers.
     ClientHelloTcpSplit,
-    /// Best-effort TCP split preset inspired by the public Patterniha finalMask
-    /// layout. It deliberately remains experimental because Xray's packet
-    /// matcher/maxSplit semantics are not identical to an AsyncWrite stream.
+    /// Two-stage compatibility preset derived from the current public
+    /// Patterniha finalMask layout: reshape the first TLS handshake record,
+    /// then slice the resulting first TCP write with a bounded split count.
     PatternihaExperimental,
 }
 
@@ -65,19 +69,12 @@ impl MaskMode {
     fn deterministic_splits(self) -> &'static [usize] {
         match self {
             Self::ClientHelloTcpSplit => &[5, 94, 1],
-            // The second pair mirrors the additional first-packet split used by
-            // the published preset as closely as this stream layer can without
-            // pretending to implement Xray's packet classifier.
-            Self::PatternihaExperimental => &[5, 94, 1, 109, 1],
             _ => &[],
         }
     }
 
-    fn is_deterministic(self) -> bool {
-        matches!(
-            self,
-            Self::ClientHelloTcpSplit | Self::PatternihaExperimental
-        )
+    fn is_simple_deterministic(self) -> bool {
+        matches!(self, Self::ClientHelloTcpSplit)
     }
 }
 
@@ -157,12 +154,11 @@ impl FragmentConfig {
             .map(|value| value.max(1))
     }
 
-    fn delay_after_split(&self, split_index: usize) -> Duration {
+    fn delay_after_split(&self, _split_index: usize) -> Duration {
         match self.mode {
             MaskMode::Off => Duration::ZERO,
             MaskMode::LegacyTcpFragment => self.pick_delay(),
             MaskMode::ClientHelloTcpSplit => Duration::ZERO,
-            MaskMode::PatternihaExperimental if split_index >= 3 => Duration::from_millis(1),
             MaskMode::PatternihaExperimental => Duration::ZERO,
         }
     }
@@ -197,16 +193,100 @@ fn parse_range(spec: &str, default: (u64, u64)) -> (u64, u64) {
     }
 }
 
+fn append_tls_record(out: &mut Vec<u8>, header_prefix: &[u8], payload: &[u8]) {
+    debug_assert!(header_prefix.len() >= 3);
+    debug_assert!(payload.len() <= u16::MAX as usize);
+    out.extend_from_slice(&header_prefix[..3]);
+    out.push(((payload.len() >> 8) & 0xff) as u8);
+    out.push((payload.len() & 0xff) as u8);
+    out.extend_from_slice(payload);
+}
+
+/// Reproduce the current Patterniha tlshello stage below the TLS library.
+///
+/// The first complete handshake record is rewritten as:
+///   empty record, 104-byte record, then one-byte records until exhausted.
+/// A single zero delay means all shaped records are handed to the TCP stage as
+/// one write. Data after the first TLS record is kept byte-for-byte.
+fn patterniha_shape_first_tls_write(buf: &[u8]) -> Option<Vec<u8>> {
+    if buf.len() <= 5 || buf[0] != 22 {
+        return None;
+    }
+    let record_len = 5 + ((usize::from(buf[3]) << 8) | usize::from(buf[4]));
+    if record_len < 5 || buf.len() < record_len {
+        return None;
+    }
+
+    let payload = &buf[5..record_len];
+    let first_len = PATTERNIHA_TLS_FIRST_PAYLOAD.min(payload.len());
+    let remaining = payload.len().saturating_sub(first_len);
+    let mut out = Vec::with_capacity(buf.len().saturating_add(10 + remaining.saturating_mul(5)));
+
+    // `lengths: ["0", "104", "1"]` in tlshello mode deliberately emits an
+    // empty TLS record for the first zero-length segment. This mirrors Xray's
+    // current finalMask semantics instead of silently clamping zero to one.
+    append_tls_record(&mut out, buf, &[]);
+    append_tls_record(&mut out, buf, &payload[..first_len]);
+
+    let mut offset = first_len;
+    while offset < payload.len() {
+        append_tls_record(&mut out, buf, &payload[offset..offset + 1]);
+        offset += 1;
+    }
+
+    out.extend_from_slice(&buf[record_len..]);
+    Some(out)
+}
+
+fn patterniha_tcp_chunk_len(split_index: usize, remaining: usize) -> usize {
+    if remaining == 0 {
+        return 0;
+    }
+    if split_index == 0 {
+        return PATTERNIHA_TCP_FIRST_WRITE.min(remaining);
+    }
+    if split_index + 1 >= PATTERNIHA_TCP_MAX_SPLITS {
+        return remaining;
+    }
+    1.min(remaining)
+}
+
+#[derive(Debug)]
+struct PatternPendingWrite {
+    bytes: Vec<u8>,
+    offset: usize,
+    original_len: usize,
+    split_index: usize,
+    split_remaining: usize,
+}
+
+impl PatternPendingWrite {
+    fn new(input: &[u8]) -> Self {
+        Self {
+            bytes: patterniha_shape_first_tls_write(input).unwrap_or_else(|| input.to_vec()),
+            offset: 0,
+            original_len: input.len(),
+            split_index: 0,
+            split_remaining: 0,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.offset >= self.bytes.len()
+    }
+}
+
 pub struct FragmentingStream<S> {
     inner: S,
     cfg: FragmentConfig,
     fragmenting: bool,
     split_index: usize,
-    /// Bytes still required to complete the current deterministic split.
+    /// Bytes still required to complete the current simple deterministic split.
     /// AsyncWrite permits short writes, so advancing the split index after any
     /// successful write would shift all later boundaries under backpressure.
     split_remaining: usize,
     pending_delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    pattern_pending: Option<PatternPendingWrite>,
 }
 
 impl<S> FragmentingStream<S> {
@@ -218,6 +298,7 @@ impl<S> FragmentingStream<S> {
             split_index: 0,
             split_remaining: 0,
             pending_delay: None,
+            pattern_pending: None,
         }
     }
 
@@ -230,14 +311,15 @@ impl<S> FragmentingStream<S> {
             self.pending_delay = Some(Box::pin(tokio::time::sleep(delay)));
         }
 
-        if self.cfg.mode.is_deterministic()
+        if self.cfg.mode.is_simple_deterministic()
             && self
                 .cfg
                 .deterministic_split_len(self.split_index)
                 .is_none()
         {
-            // The requested mask sequence is complete. Forward the rest of the
-            // ClientHello in the TLS implementation's natural write pattern.
+            // The requested simple split sequence is complete. Forward the
+            // remaining ClientHello bytes in the TLS implementation's natural
+            // write pattern.
             self.fragmenting = false;
         }
     }
@@ -254,7 +336,7 @@ where
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         // Once the server starts answering, the ClientHello phase is over. Do
-        // not fragment application traffic or subsequent TLS records.
+        // not alter application traffic or subsequent TLS records.
         this.fragmenting = false;
         this.split_remaining = 0;
         Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -276,6 +358,79 @@ where
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
 
+        if this.cfg.mode == MaskMode::PatternihaExperimental {
+            if this.pattern_pending.is_none() {
+                this.pattern_pending = Some(PatternPendingWrite::new(buf));
+            }
+
+            loop {
+                if let Some(sleep) = this.pending_delay.as_mut() {
+                    match sleep.as_mut().poll(cx) {
+                        Poll::Ready(()) => this.pending_delay = None,
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+
+                if this.pattern_pending.as_ref().is_some_and(PatternPendingWrite::done) {
+                    let consumed = this
+                        .pattern_pending
+                        .take()
+                        .map(|pending| pending.original_len)
+                        .unwrap_or(buf.len());
+                    this.fragmenting = false;
+                    return Poll::Ready(Ok(consumed));
+                }
+
+                let (result, completed_chunk) = {
+                    let (inner, pending_slot) = (&mut this.inner, &mut this.pattern_pending);
+                    let pending = pending_slot
+                        .as_mut()
+                        .expect("pattern write exists while compatibility mask is active");
+                    let remaining = pending.bytes.len().saturating_sub(pending.offset);
+                    if pending.split_remaining == 0 {
+                        pending.split_remaining =
+                            patterniha_tcp_chunk_len(pending.split_index, remaining);
+                    }
+                    let chunk_len = pending.split_remaining.min(remaining);
+                    if chunk_len == 0 {
+                        (Poll::Ready(Ok(0)), false)
+                    } else {
+                        let start = pending.offset;
+                        let end = start + chunk_len;
+                        match Pin::new(inner).poll_write(cx, &pending.bytes[start..end]) {
+                            Poll::Ready(Ok(n)) => {
+                                if n > 0 {
+                                    pending.offset = pending.offset.saturating_add(n);
+                                    pending.split_remaining = pending.split_remaining.saturating_sub(n);
+                                }
+                                (Poll::Ready(Ok(n)), n > 0 && pending.split_remaining == 0)
+                            }
+                            Poll::Ready(Err(error)) => (Poll::Ready(Err(error)), false),
+                            Poll::Pending => (Poll::Pending, false),
+                        }
+                    }
+                };
+
+                match result {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
+                    Poll::Ready(Ok(_)) => {
+                        if completed_chunk {
+                            if let Some(pending) = this.pattern_pending.as_mut() {
+                                pending.split_index = pending.split_index.saturating_add(1);
+                            }
+                            this.pending_delay = Some(Box::pin(tokio::time::sleep(
+                                Duration::from_millis(PATTERNIHA_TCP_DELAY_MS),
+                            )));
+                        }
+                        // Continue until the underlying writer blocks or the
+                        // requested transformed write has been completely sent.
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
         if let Some(sleep) = this.pending_delay.as_mut() {
             match sleep.as_mut().poll(cx) {
                 Poll::Ready(()) => this.pending_delay = None,
@@ -284,7 +439,7 @@ where
         }
 
         let split_index = this.split_index;
-        let deterministic = this.cfg.mode.is_deterministic();
+        let deterministic = this.cfg.mode.is_simple_deterministic();
         let chunk_len = if deterministic {
             if this.split_remaining == 0 {
                 let Some(target) = this.cfg.deterministic_split_len(split_index) else {
@@ -377,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn clienthello_split_uses_deterministic_boundaries_then_releases_the_rest() {
+    fn clienthello_split_uses_existing_deterministic_boundaries() {
         let cfg = FragmentConfig {
             enabled: true,
             mode: MaskMode::ClientHelloTcpSplit,
@@ -392,21 +547,61 @@ mod tests {
         assert_eq!(cfg.deterministic_split_len(3), None);
     }
 
-    #[test]
-    fn patterniha_preset_is_explicitly_bounded_to_clienthello_writes() {
-        let cfg = FragmentConfig {
-            enabled: true,
-            mode: MaskMode::PatternihaExperimental,
-            size_min: 16,
-            size_max: 32,
-            delay_min_ms: 2,
-            delay_max_ms: 10,
-        };
-        let expected = [5, 94, 1, 109, 1];
-        for (index, size) in expected.into_iter().enumerate() {
-            assert_eq!(cfg.deterministic_split_len(index), Some(size));
+    fn tls_handshake_record(payload_len: usize) -> Vec<u8> {
+        let mut record = vec![22, 3, 3, ((payload_len >> 8) & 0xff) as u8, (payload_len & 0xff) as u8];
+        record.extend((0..payload_len).map(|index| (index % 251) as u8));
+        record
+    }
+
+    fn tls_record_lengths(bytes: &[u8]) -> Vec<usize> {
+        let mut lengths = Vec::new();
+        let mut offset = 0;
+        while offset + 5 <= bytes.len() {
+            if bytes[offset] != 22 {
+                break;
+            }
+            let len = (usize::from(bytes[offset + 3]) << 8) | usize::from(bytes[offset + 4]);
+            if offset + 5 + len > bytes.len() {
+                break;
+            }
+            lengths.push(len);
+            offset += 5 + len;
         }
-        assert_eq!(cfg.deterministic_split_len(expected.len()), None);
+        lengths
+    }
+
+    #[test]
+    fn patterniha_tls_stage_preserves_zero_104_then_one_byte_semantics() {
+        let input = tls_handshake_record(108);
+        let shaped = patterniha_shape_first_tls_write(&input).unwrap();
+        assert_eq!(tls_record_lengths(&shaped), vec![0, 104, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn patterniha_tls_stage_preserves_trailing_records_byte_for_byte() {
+        let mut input = tls_handshake_record(104);
+        let trailing = [23, 3, 3, 0, 2, 0xaa, 0xbb];
+        input.extend_from_slice(&trailing);
+        let shaped = patterniha_shape_first_tls_write(&input).unwrap();
+        assert!(shaped.ends_with(&trailing));
+    }
+
+    #[test]
+    fn patterniha_tcp_stage_is_bounded_to_eleven_writes() {
+        let mut remaining = 300;
+        let mut chunks = Vec::new();
+        for split_index in 0..PATTERNIHA_TCP_MAX_SPLITS {
+            let chunk = patterniha_tcp_chunk_len(split_index, remaining);
+            chunks.push(chunk);
+            remaining = remaining.saturating_sub(chunk);
+            if remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(chunks[0], 114);
+        assert_eq!(&chunks[1..10], &[1; 9]);
+        assert_eq!(chunks[10], 177);
+        assert_eq!(remaining, 0);
     }
 
     #[derive(Default)]
@@ -459,5 +654,29 @@ mod tests {
         assert_eq!(stream.split_index, 3);
         assert_eq!(stream.split_remaining, 0);
         assert!(!stream.fragmenting);
+    }
+
+    #[tokio::test]
+    async fn patterniha_mode_rewrites_first_tls_record_and_survives_short_writes() {
+        let cfg = FragmentConfig {
+            enabled: true,
+            mode: MaskMode::PatternihaExperimental,
+            size_min: 16,
+            size_max: 32,
+            delay_min_ms: 0,
+            delay_max_ms: 0,
+        };
+        let inner = ShortWriter {
+            max_per_write: 17,
+            ..ShortWriter::default()
+        };
+        let mut stream = FragmentingStream::new(inner, cfg);
+        let input = tls_handshake_record(108);
+        let expected = patterniha_shape_first_tls_write(&input).unwrap();
+        stream.write_all(&input).await.unwrap();
+
+        assert_eq!(stream.inner.bytes, expected);
+        assert!(!stream.fragmenting);
+        assert!(stream.pattern_pending.is_none());
     }
 }

@@ -29,34 +29,36 @@ impl NoizeConfig {
         }
     }
 
+    // Preserve the established MASQUE profiles exactly. Existing users may be
+    // relying on their current wire shape, so the new profiles are added around
+    // them instead of silently changing those fingerprints.
     pub fn light() -> Self {
         Self {
             jc_before_hs: 1,
             jc_after_i1: 0,
             jmin: 32,
             jmax: 96,
-            i1: Some("<b 0d0a0d0a><t><r 12-20>".to_string()),
+            i1: Some("<b 0d0a0d0a><t><r 16>".to_string()),
             i2: None,
             junk_interval: Duration::from_millis(3),
         }
     }
 
-    /// Conservative MASQUE cover traffic for ordinary restrictive firewalls.
-    /// Keep this as the MASQUE default: it adds diversity without the larger
-    /// burst sizes used by the censorship-focused profiles.
     pub fn firewall() -> Self {
         Self {
             jc_before_hs: 2,
-            jc_after_i1: 1,
+            jc_after_i1: 2,
             jmin: 48,
-            jmax: 176,
-            i1: Some("<b 0d0a0d0a><t><n><r 16-28>".to_string()),
-            i2: Some("<r 32-56>".to_string()),
+            jmax: 190,
+            i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
+            i2: Some("<r 48>".to_string()),
             junk_interval: Duration::from_millis(4),
         }
     }
 
-    /// General-purpose profile with wider packet-size variance than firewall.
+    /// A distinct middle-ground profile. Historically the name `balanced`
+    /// fell through to `firewall`; keep firewall stable and give balanced its
+    /// own randomized signature/size distribution instead.
     pub fn balanced() -> Self {
         Self {
             jc_before_hs: 2,
@@ -69,23 +71,21 @@ impl NoizeConfig {
         }
     }
 
-    /// Heavier profile intended for networks doing aggressive UDP/DPI filtering.
-    /// It intentionally uses a different signature family and slower spacing
-    /// instead of being an alias for `aggressive`.
     pub fn gfw() -> Self {
         Self {
-            jc_before_hs: 3,
-            jc_after_i1: 2,
-            jmin: 72,
-            jmax: 320,
-            i1: Some("<n><t><r 28-52>".to_string()),
-            i2: Some("<b 47455420><n><r 48-80>".to_string()),
+            jc_before_hs: 2,
+            jc_after_i1: 1,
+            jmin: 64,
+            jmax: 256,
+            i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
+            i2: Some("<r 32>".to_string()),
             junk_interval: Duration::from_millis(5),
         }
     }
 
-    /// Maximum built-in MASQUE cover traffic. This remains opt-in because the
-    /// extra packets and delay can cost battery and connection setup time.
+    /// A new maximum-cover profile. Historically `aggressive` was only an
+    /// alias for `gfw`; keep gfw's established shape and make aggressive the
+    /// opt-in heavier variant instead.
     pub fn aggressive() -> Self {
         Self {
             jc_before_hs: 4,
@@ -275,6 +275,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn established_masque_profiles_keep_their_wire_settings() {
+        let light = from_profile("light");
+        assert_eq!(light.jc_before_hs, 1);
+        assert_eq!(light.jmax, 96);
+        assert_eq!(light.i1.as_deref(), Some("<b 0d0a0d0a><t><r 16>"));
+
+        let firewall = from_profile("firewall");
+        assert_eq!(firewall.jc_before_hs, 2);
+        assert_eq!(firewall.jc_after_i1, 2);
+        assert_eq!(firewall.jmax, 190);
+        assert_eq!(firewall.i1.as_deref(), Some("<b 0d0a0d0a><t><r 24>"));
+
+        let gfw = from_profile("gfw");
+        assert_eq!(gfw.jc_before_hs, 2);
+        assert_eq!(gfw.jc_after_i1, 1);
+        assert_eq!(gfw.jmax, 256);
+        assert_eq!(gfw.i2.as_deref(), Some("<r 32>"));
     }
 
     #[test]

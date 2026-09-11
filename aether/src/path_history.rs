@@ -347,15 +347,34 @@ fn detected_network_key() -> Option<String> {
     Some(format!("route-v1:{:016x}", stable_hash(&material.join("|"))))
 }
 
-pub fn network_key_from_env() -> String {
+fn configured_network_key() -> Option<String> {
     std::env::var("AETHER_NETWORK_KEY")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(detected_network_key)
-        // Do not share persistent winners across unknown underlays. A
-        // process-scoped key preserves correctness at the cost of replay only.
-        .unwrap_or_else(|| format!("unknown-process:{}", std::process::id()))
+}
+
+fn choose_network_key(
+    detected: Option<String>,
+    configured: Option<String>,
+    process_id: u32,
+) -> String {
+    // The GUI-provided value is a launch-time hint. Route identity can change
+    // while Aether stays alive (Wi-Fi <-> cellular, roaming, DHCP/default-route
+    // changes), so live detection must win whenever it is available. Falling
+    // back to the launch hint keeps platforms with incomplete route discovery
+    // network-scoped instead of sharing one global history.
+    detected
+        .or(configured)
+        .unwrap_or_else(|| format!("unknown-process:{process_id}"))
+}
+
+pub fn network_key_from_env() -> String {
+    choose_network_key(
+        detected_network_key(),
+        configured_network_key(),
+        std::process::id(),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -469,5 +488,26 @@ mod tests {
         let fingerprint = format!("route-v1:{:016x}", stable_hash(material));
         assert!(!fingerprint.contains("192.168"));
         assert!(!fingerprint.contains("wlan0"));
+    }
+
+    #[test]
+    fn live_detection_wins_over_stale_launch_hint() {
+        assert_eq!(
+            choose_network_key(Some("wifi-b".into()), Some("wifi-a".into()), 42),
+            "wifi-b"
+        );
+    }
+
+    #[test]
+    fn launch_hint_is_used_when_live_detection_is_unavailable() {
+        assert_eq!(
+            choose_network_key(None, Some("wifi-a".into()), 42),
+            "wifi-a"
+        );
+    }
+
+    #[test]
+    fn unknown_underlay_remains_process_scoped() {
+        assert_eq!(choose_network_key(None, None, 42), "unknown-process:42");
     }
 }

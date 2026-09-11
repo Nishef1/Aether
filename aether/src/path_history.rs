@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::net::{SocketAddr, UdpSocket};
+#[cfg(any(target_os = "macos", windows))]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 

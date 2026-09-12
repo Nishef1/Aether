@@ -31,6 +31,16 @@ fn http_probe_port() -> u16 {
         .unwrap_or(80)
 }
 
+fn http_probe_request() -> String {
+    // Keep the request deliberately minimal. The probe only needs an HTTP 204
+    // to prove real application traffic crosses the selected tunnel; attaching
+    // a product-specific User-Agent would unnecessarily identify Aether to the
+    // probe destination and to infrastructure on the exit side.
+    format!(
+        "GET {HTTP_PROBE_PATH} HTTP/1.1\r\nHost: {HTTP_PROBE_HOST}\r\nConnection: close\r\n\r\n"
+    )
+}
+
 async fn http_probe(stack: &netstack::StackHandle) -> Result<()> {
     let ip = socks::dns_resolve(stack, HTTP_PROBE_HOST).await?;
     let dst = SocketAddr::new(ip, http_probe_port());
@@ -38,10 +48,7 @@ async fn http_probe(stack: &netstack::StackHandle) -> Result<()> {
     let conn = stack.open_tcp(dst).await?;
     let (sender, mut from_stack) = conn.into_split();
 
-    let request = format!(
-        "GET {HTTP_PROBE_PATH} HTTP/1.1\r\nHost: {HTTP_PROBE_HOST}\r\nConnection: close\r\nUser-Agent: aether-ironclad\r\n\r\n"
-    );
-    sender.send(request.into_bytes()).await?;
+    sender.send(http_probe_request().into_bytes()).await?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let mut buf = Vec::new();
@@ -223,7 +230,7 @@ pub async fn wg_http_ping_established(
 
 #[cfg(test)]
 mod tests {
-    use super::http_status_code;
+    use super::{http_probe_request, http_status_code};
 
     #[test]
     fn reads_the_status_code_from_the_status_line() {
@@ -245,5 +252,14 @@ mod tests {
         assert_eq!(http_status_code("204"), None);
         assert_eq!(http_status_code("GET / HTTP/1.1"), None);
         assert_eq!(http_status_code("HTTP/1.1 abc"), None);
+    }
+
+    #[test]
+    fn ironclad_probe_does_not_identify_aether() {
+        let request = http_probe_request();
+        assert!(!request.to_ascii_lowercase().contains("aether"));
+        assert!(!request.to_ascii_lowercase().contains("user-agent:"));
+        assert!(request.contains("Host: www.gstatic.com\r\n"));
+        assert!(request.ends_with("Connection: close\r\n\r\n"));
     }
 }

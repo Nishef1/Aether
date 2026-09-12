@@ -166,6 +166,7 @@ impl WgTunnel {
         let client_id_h = self.client_id;
         let peer = self.peer;
         let local_ipv4 = self.local_ipv4;
+        let keepalive_junk = wg_keepalive_junk_enabled();
 
         // Only authenticated tunnel payload refreshes dataplane liveness. A
         // handshake/control packet alone is not enough to claim the tunnel can
@@ -279,7 +280,10 @@ impl WgTunnel {
                     inject_client_id(&mut pkt_vec, &client_id);
                     drop(tunn);
 
-                    if aethernoize_t.is_enabled() {
+                    // Persistent keepalive already provides the liveness packet.
+                    // Extra random datagrams create a recurring synthetic cadence,
+                    // cost battery, and are disabled unless explicitly requested.
+                    if keepalive_junk && aethernoize_t.is_enabled() {
                         aethernoize::send_keepalive_junk(&sock_t, &aethernoize_t).await;
                     }
                     let _ = sock_t.send(&pkt_vec).await;
@@ -288,10 +292,12 @@ impl WgTunnel {
         });
 
         let stale_timeout = wg_stale_timeout();
+        let probe_after = wg_health_probe_after(stale_timeout);
         let health_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(WG_HEALTHCHECK_INTERVAL);
-            let probe = masque::build_dns_probe(local_ipv4);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut out_buf = vec![0u8; MAX_PACKET];
+            let mut probe_in_flight = false;
             loop {
                 interval.tick().await;
 
@@ -307,8 +313,21 @@ impl WgTunnel {
                     ));
                 }
 
+                if idle < probe_after {
+                    probe_in_flight = false;
+                    continue;
+                }
+
+                // One transaction-aware probe is enough for the current idle
+                // window. A matching authenticated reply refreshes last_valid_rx;
+                // otherwise the existing stale deadline decides the tunnel is dead.
+                if probe_in_flight {
+                    continue;
+                }
+
+                let probe = masque::build_dns_probe(local_ipv4);
                 let mut tunn = tunn_h.lock().await;
-                if let Err(e) = send_dataplane_probe(
+                match send_dataplane_probe(
                     &sock_h,
                     &mut tunn,
                     &client_id_h,
@@ -317,7 +336,8 @@ impl WgTunnel {
                 )
                 .await
                 {
-                    log::trace!("[wg] health probe send failed: {e}");
+                    Ok(()) => probe_in_flight = true,
+                    Err(e) => log::trace!("[wg] health probe send failed: {e}"),
                 }
             }
         });
@@ -362,6 +382,22 @@ fn wg_stale_timeout() -> Duration {
         .filter(|&v| v > 0)
         .unwrap_or(10);
     Duration::from_secs(secs)
+}
+
+fn wg_health_probe_after(stale_timeout: Duration) -> Duration {
+    stale_timeout / 2
+}
+
+fn wg_keepalive_junk_enabled() -> bool {
+    std::env::var("AETHER_WG_KEEPALIVE_JUNK")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 async fn send_dataplane_probe(
@@ -857,6 +893,18 @@ mod tests {
                 "{kind:?} should be fatal"
             );
         }
+    }
+
+    #[test]
+    fn health_probe_waits_until_half_the_stale_budget() {
+        assert_eq!(
+            wg_health_probe_after(Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            wg_health_probe_after(Duration::from_secs(18)),
+            Duration::from_secs(9)
+        );
     }
 
     #[tokio::test]

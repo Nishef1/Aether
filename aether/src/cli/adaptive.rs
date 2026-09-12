@@ -5,6 +5,8 @@ struct AdaptiveNetworkDefaults {
     masque_startup_secs: u16,
     h2_keepalive_secs: u16,
     h2_keepalive_timeout_secs: u16,
+    h3_keepalive_secs: u16,
+    wg_keepalive_secs: u16,
     wg_stale_secs: u16,
     wg_endpoint_cooldown_secs: u16,
     probe_jitter_ms: u16,
@@ -18,12 +20,14 @@ struct AdaptiveNetworkDefaults {
 /// escape hatch for expert deployments.
 fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
     let defaults = match mode.trim().to_ascii_lowercase().as_str() {
-        // Interactive/gaming: fail a dead path quickly, keep H2 liveness tight,
-        // and never add artificial delay to the first-healthy search.
+        // Interactive/gaming: fail a dead path quickly. Keepalives remain
+        // idle-driven, so active traffic itself is the liveness signal.
         "turbo" => AdaptiveNetworkDefaults {
             masque_startup_secs: 20,
             h2_keepalive_secs: 10,
             h2_keepalive_timeout_secs: 15,
+            h3_keepalive_secs: 20,
+            wg_keepalive_secs: 25,
             wg_stale_secs: 10,
             wg_endpoint_cooldown_secs: 180,
             probe_jitter_ms: 0,
@@ -34,6 +38,8 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             masque_startup_secs: 30,
             h2_keepalive_secs: 15,
             h2_keepalive_timeout_secs: 20,
+            h3_keepalive_secs: 20,
+            wg_keepalive_secs: 25,
             wg_stale_secs: 12,
             wg_endpoint_cooldown_secs: 300,
             probe_jitter_ms: 10,
@@ -45,17 +51,20 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             masque_startup_secs: 45,
             h2_keepalive_secs: 15,
             h2_keepalive_timeout_secs: 25,
+            h3_keepalive_secs: 20,
+            wg_keepalive_secs: 25,
             wg_stale_secs: 18,
             wg_endpoint_cooldown_secs: 120,
             probe_jitter_ms: 20,
         },
-        // Low-observability mode: fewer timing signatures and much less churn.
-        // Longer liveness windows avoid turning a transient pause into another
-        // conspicuous reconnect/scan cycle.
+        // Low-observability discovery mode: fewer probes in flight and much
+        // less reconnect churn. This does not alter live application traffic.
         "stealth" => AdaptiveNetworkDefaults {
             masque_startup_secs: 60,
             h2_keepalive_secs: 25,
             h2_keepalive_timeout_secs: 35,
+            h3_keepalive_secs: 30,
+            wg_keepalive_secs: 25,
             wg_stale_secs: 25,
             wg_endpoint_cooldown_secs: 600,
             probe_jitter_ms: 200,
@@ -66,6 +75,8 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             masque_startup_secs: 45,
             h2_keepalive_secs: 15,
             h2_keepalive_timeout_secs: 20,
+            h3_keepalive_secs: 20,
+            wg_keepalive_secs: 25,
             wg_stale_secs: 15,
             wg_endpoint_cooldown_secs: 300,
             probe_jitter_ms: 30,
@@ -109,6 +120,14 @@ pub(super) fn apply_for_configured_scan() {
         "AETHER_MASQUE_H2_KEEPALIVE_TIMEOUT_SECS",
         defaults.h2_keepalive_timeout_secs,
     );
+    set_default(
+        "AETHER_MASQUE_H3_KEEPALIVE_SECS",
+        defaults.h3_keepalive_secs,
+    );
+    // WireGuard itself recommends 25 seconds when a persistent NAT/firewall
+    // keepalive is actually needed. It stays an expert override: an explicit
+    // --keepalive/AETHER_WG_KEEPALIVE value always wins over this default.
+    set_default("AETHER_WG_KEEPALIVE", defaults.wg_keepalive_secs);
     set_default("AETHER_WG_STALE_SECS", defaults.wg_stale_secs);
     set_default(
         "AETHER_WG_ENDPOINT_COOLDOWN_SECS",
@@ -128,6 +147,7 @@ mod tests {
 
         assert!(turbo.masque_startup_secs < balanced.masque_startup_secs);
         assert!(turbo.h2_keepalive_secs < balanced.h2_keepalive_secs);
+        assert_eq!(turbo.wg_keepalive_secs, 25);
         assert_eq!(turbo.probe_jitter_ms, 0);
     }
 
@@ -140,6 +160,8 @@ mod tests {
         assert!(stealth.wg_stale_secs > balanced.wg_stale_secs);
         assert!(stealth.wg_endpoint_cooldown_secs > balanced.wg_endpoint_cooldown_secs);
         assert!(stealth.h2_keepalive_timeout_secs > stealth.h2_keepalive_secs);
+        assert!(stealth.h3_keepalive_secs > balanced.h3_keepalive_secs);
+        assert_eq!(stealth.wg_keepalive_secs, 25);
     }
 
     #[test]

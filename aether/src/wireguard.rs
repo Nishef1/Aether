@@ -400,6 +400,19 @@ fn wg_keepalive_junk_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn keepalive_from_sources(env_value: Option<&str>, requested: Option<u16>) -> u16 {
+    env_value
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .or(requested.filter(|value| *value > 0))
+        .unwrap_or(25)
+}
+
+fn configured_keepalive(requested: Option<u16>) -> u16 {
+    let env_value = std::env::var("AETHER_WG_KEEPALIVE").ok();
+    keepalive_from_sources(env_value.as_deref(), requested)
+}
+
 async fn send_dataplane_probe(
     sock: &UdpSocket,
     tunn: &mut Tunn,
@@ -575,12 +588,13 @@ pub async fn verify_endpoint_keep_session(
 
     let local_secret = StaticSecret::from(private_key);
     let peer_pk = PublicKey::from(peer_public);
+    let persistent_keepalive = configured_keepalive(keepalive);
 
     let mut tunn = Tunn::new(
         local_secret,
         peer_pk,
         None,
-        Some(keepalive.unwrap_or(25)),
+        Some(persistent_keepalive),
         0,
         None,
     );
@@ -905,6 +919,15 @@ mod tests {
             wg_health_probe_after(Duration::from_secs(18)),
             Duration::from_secs(9)
         );
+    }
+
+    #[test]
+    fn configured_keepalive_wins_over_internal_wiw_hint() {
+        assert_eq!(keepalive_from_sources(Some("25"), Some(5)), 25);
+        assert_eq!(keepalive_from_sources(Some("25"), Some(20)), 25);
+        assert_eq!(keepalive_from_sources(Some("5"), Some(25)), 5);
+        assert_eq!(keepalive_from_sources(None, Some(20)), 20);
+        assert_eq!(keepalive_from_sources(None, None), 25);
     }
 
     #[tokio::test]

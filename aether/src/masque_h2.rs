@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
@@ -98,6 +99,19 @@ fn h2_keepalive_timeout() -> Duration {
         .filter(|&v| v > 0)
         .unwrap_or(20);
     Duration::from_secs(secs)
+}
+
+fn mark_activity(last_activity: &StdMutex<Instant>) {
+    if let Ok(mut activity) = last_activity.lock() {
+        *activity = Instant::now();
+    }
+}
+
+fn keepalive_due(last_activity: &StdMutex<Instant>, period: Duration) -> bool {
+    last_activity
+        .lock()
+        .map(|activity| activity.elapsed() >= period)
+        .unwrap_or(true)
 }
 
 pub fn enabled() -> bool {
@@ -393,11 +407,15 @@ pub async fn run(
 
     let mut recv_body = response.into_body();
     let mut capsules = CapsuleParser::new();
+    let last_activity = Arc::new(StdMutex::new(Instant::now()));
 
     let (sender_tx, sender_rx) = mpsc::channel::<SenderMsg>(16);
     let (outcome_tx, mut sender_outcome) = oneshot::channel::<Result<()>>();
+    let sender_activity = last_activity.clone();
     let sender_task = tokio::spawn(async move {
-        let _ = outcome_tx.send(pump_outbound(send_stream, outbound_rx, sender_rx).await);
+        let _ = outcome_tx.send(
+            pump_outbound(send_stream, outbound_rx, sender_rx, sender_activity).await,
+        );
     });
     let _sender_guard = AbortOnDrop(sender_task.abort_handle());
 
@@ -465,11 +483,14 @@ pub async fn run(
             biased;
 
             _ = keepalive_interval.tick(), if ready_fired && !awaiting_pong => {
+                if !keepalive_due(&last_activity, keepalive_period) {
+                    continue;
+                }
                 match ping_pong.send_ping(h2::Ping::opaque()) {
                     Ok(()) => {
                         awaiting_pong = true;
                         pong_deadline = Some(Instant::now() + keepalive_timeout);
-                        log::debug!("[h2] keepalive ping sent");
+                        log::debug!("[h2] idle keepalive ping sent");
                     }
                     Err(e) => log::debug!("[h2] keepalive ping send failed: {e}"),
                 }
@@ -480,6 +501,7 @@ pub async fn run(
                     Ok(_) => {
                         awaiting_pong = false;
                         pong_deadline = None;
+                        mark_activity(&last_activity);
                         log::debug!("[h2] keepalive pong received");
                     }
                     Err(e) => {
@@ -525,6 +547,7 @@ pub async fn run(
             data = futures::future::poll_fn(|cx| recv_body.poll_data(cx)) => {
                 match data {
                     Some(Ok(chunk)) => {
+                        mark_activity(&last_activity);
                         let _ = recv_body.flow_control().release_capacity(chunk.len());
                         capsules.push(&chunk);
                         let got_probe_reply =
@@ -585,6 +608,7 @@ async fn pump_outbound(
     mut send: h2::SendStream<Bytes>,
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     mut control_rx: mpsc::Receiver<SenderMsg>,
+    last_activity: Arc<StdMutex<Instant>>,
 ) -> Result<()> {
     let mut batch: Vec<u8> = Vec::with_capacity(H2_SEND_BATCH_BYTES);
 
@@ -594,7 +618,10 @@ async fn pump_outbound(
 
             msg = control_rx.recv() => {
                 match msg {
-                    Some(SenderMsg::Capsule(framed)) => send_capsule(&mut send, framed).await?,
+                    Some(SenderMsg::Capsule(framed)) => {
+                        send_capsule(&mut send, framed).await?;
+                        mark_activity(&last_activity);
+                    }
                     Some(SenderMsg::Finish) | None => {
                         let _ = send.send_data(Bytes::new(), true);
                         return Ok(());
@@ -622,6 +649,7 @@ async fn pump_outbound(
                     Vec::with_capacity(H2_SEND_BATCH_BYTES),
                 );
                 send_capsule(&mut send, Bytes::from(framed)).await?;
+                mark_activity(&last_activity);
             }
         }
     }

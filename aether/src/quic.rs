@@ -77,6 +77,15 @@ fn data_check_enabled() -> bool {
     std::env::var("AETHER_MASQUE_NO_DATA_CHECK").is_err()
 }
 
+fn h3_keepalive_interval() -> Duration {
+    let secs = std::env::var("AETHER_MASQUE_H3_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(20);
+    Duration::from_secs(secs)
+}
+
 const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
 
 pub struct Channels {
@@ -242,8 +251,10 @@ pub async fn run(
     flush(&mut conn, &sockets).await?;
 
     let mut out_buf = vec![0u8; 65535];
-    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(20));
+    let keepalive_period = h3_keepalive_interval();
+    let mut keepalive_interval = tokio::time::interval(keepalive_period);
     keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_activity = Instant::now();
 
     let mut probe_interval = tokio::time::interval(Duration::from_millis(700));
     probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -272,9 +283,13 @@ pub async fn run(
             biased;
 
             _ = keepalive_interval.tick() => {
-                if conn.is_established() {
-                    if let Err(e) = conn.send_ack_eliciting() {
-                        log::debug!("keepalive ping failed: {e}");
+                if conn.is_established() && last_activity.elapsed() >= keepalive_period {
+                    match conn.send_ack_eliciting() {
+                        Ok(()) => {
+                            last_activity = Instant::now();
+                            log::debug!("idle quic keepalive sent");
+                        }
+                        Err(e) => log::debug!("keepalive ping failed: {e}"),
                     }
                 }
             }
@@ -300,6 +315,8 @@ pub async fn run(
                 let info = quiche::RecvInfo { from, to: to_local };
                 if let Err(e) = conn.recv(&mut data, info) {
                     log::trace!("recv error: {e}");
+                } else {
+                    last_activity = Instant::now();
                 }
             }
 
@@ -308,6 +325,8 @@ pub async fn run(
                     Some(Control::Migrate) => {
                         if let Err(e) = do_migrate(&mut conn, peer, &mut sockets, &net_tx, &mut readers).await {
                             log::warn!("migration failed: {e}");
+                        } else {
+                            last_activity = Instant::now();
                         }
                     }
                     Some(Control::Close) => {
@@ -327,8 +346,9 @@ pub async fn run(
                         if let Some(sid) = req_stream {
                             match masque::encode_ip_datagram(sid, &ip_packet) {
                                 Ok(framed) => {
-                                    if let Err(e) = conn.dgram_send(&framed) {
-                                        log::trace!("dgram_send: {e}");
+                                    match conn.dgram_send(&framed) {
+                                        Ok(()) => last_activity = Instant::now(),
+                                        Err(e) => log::trace!("dgram_send: {e}"),
                                     }
                                 }
                                 Err(e) => log::trace!("encap: {e}"),
@@ -359,6 +379,7 @@ pub async fn run(
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&cfg.authority, &cfg.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
+            last_activity = Instant::now();
             log_or_debug(quiet, format!("connect-ip request sent on stream {sid}"));
             req_stream = Some(sid);
             h3_conn = Some(h3c);
@@ -389,6 +410,10 @@ pub async fn run(
             &mut out_buf,
             &probe,
         );
+
+        if got_probe_reply {
+            last_activity = Instant::now();
+        }
 
         if got_probe_reply && !ready_fired {
             validate_successes += 1;
@@ -437,6 +462,7 @@ pub async fn run(
                     capsules = CapsuleParser::new();
                     probe = masque::build_dns_probe(cfg.local_ipv4);
                     validate_successes = 0;
+                    last_activity = Instant::now();
                     flush(&mut conn, &sockets).await?;
                     continue;
                 }

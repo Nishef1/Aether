@@ -1,12 +1,13 @@
 use std::env;
 
+const DEFAULT_WG_KEEPALIVE_SECS: u16 = 25;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdaptiveNetworkDefaults {
     masque_startup_secs: u16,
     h2_keepalive_secs: u16,
     h2_keepalive_timeout_secs: u16,
     h3_keepalive_secs: u16,
-    wg_keepalive_secs: u16,
     wg_stale_secs: u16,
     wg_endpoint_cooldown_secs: u16,
     probe_jitter_ms: u16,
@@ -27,7 +28,6 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             h2_keepalive_secs: 10,
             h2_keepalive_timeout_secs: 15,
             h3_keepalive_secs: 20,
-            wg_keepalive_secs: 25,
             wg_stale_secs: 10,
             wg_endpoint_cooldown_secs: 180,
             probe_jitter_ms: 0,
@@ -39,7 +39,6 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             h2_keepalive_secs: 15,
             h2_keepalive_timeout_secs: 20,
             h3_keepalive_secs: 20,
-            wg_keepalive_secs: 25,
             wg_stale_secs: 12,
             wg_endpoint_cooldown_secs: 300,
             probe_jitter_ms: 10,
@@ -52,7 +51,6 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             h2_keepalive_secs: 15,
             h2_keepalive_timeout_secs: 25,
             h3_keepalive_secs: 20,
-            wg_keepalive_secs: 25,
             wg_stale_secs: 18,
             wg_endpoint_cooldown_secs: 120,
             probe_jitter_ms: 20,
@@ -64,7 +62,6 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             h2_keepalive_secs: 25,
             h2_keepalive_timeout_secs: 35,
             h3_keepalive_secs: 30,
-            wg_keepalive_secs: 25,
             wg_stale_secs: 25,
             wg_endpoint_cooldown_secs: 600,
             probe_jitter_ms: 200,
@@ -76,7 +73,6 @@ fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
             h2_keepalive_secs: 15,
             h2_keepalive_timeout_secs: 20,
             h3_keepalive_secs: 20,
-            wg_keepalive_secs: 25,
             wg_stale_secs: 15,
             wg_endpoint_cooldown_secs: 300,
             probe_jitter_ms: 30,
@@ -100,10 +96,16 @@ fn set_default(key: &str, value: impl ToString) {
     env::set_var(key, value.to_string());
 }
 
-/// Apply mode-derived runtime defaults after CLI flags have been parsed.
+/// Apply runtime defaults after CLI flags have been parsed.
 /// Explicit flags/environment values win because `set_default` only fills
 /// missing values.
 pub(super) fn apply_for_configured_scan() {
+    // PersistentKeepalive is transport policy rather than scan policy. Keep a
+    // single conservative default for direct WireGuard and both WiW hops even
+    // when the standalone core is run interactively without --scan. An
+    // explicit --keepalive/AETHER_WG_KEEPALIVE value always wins.
+    set_default("AETHER_WG_KEEPALIVE", DEFAULT_WG_KEEPALIVE_SECS);
+
     let Ok(mode) = env::var("AETHER_SCAN") else {
         return;
     };
@@ -124,10 +126,6 @@ pub(super) fn apply_for_configured_scan() {
         "AETHER_MASQUE_H3_KEEPALIVE_SECS",
         defaults.h3_keepalive_secs,
     );
-    // WireGuard itself recommends 25 seconds when a persistent NAT/firewall
-    // keepalive is actually needed. It stays an expert override: an explicit
-    // --keepalive/AETHER_WG_KEEPALIVE value always wins over this default.
-    set_default("AETHER_WG_KEEPALIVE", defaults.wg_keepalive_secs);
     set_default("AETHER_WG_STALE_SECS", defaults.wg_stale_secs);
     set_default(
         "AETHER_WG_ENDPOINT_COOLDOWN_SECS",
@@ -141,13 +139,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wireguard_idle_keepalive_has_one_transport_wide_default() {
+        assert_eq!(DEFAULT_WG_KEEPALIVE_SECS, 25);
+    }
+
+    #[test]
     fn turbo_is_the_fail_fast_policy() {
         let turbo = defaults_for_scan("turbo").unwrap();
         let balanced = defaults_for_scan("balanced").unwrap();
 
         assert!(turbo.masque_startup_secs < balanced.masque_startup_secs);
         assert!(turbo.h2_keepalive_secs < balanced.h2_keepalive_secs);
-        assert_eq!(turbo.wg_keepalive_secs, 25);
         assert_eq!(turbo.probe_jitter_ms, 0);
     }
 
@@ -161,7 +163,6 @@ mod tests {
         assert!(stealth.wg_endpoint_cooldown_secs > balanced.wg_endpoint_cooldown_secs);
         assert!(stealth.h2_keepalive_timeout_secs > stealth.h2_keepalive_secs);
         assert!(stealth.h3_keepalive_secs > balanced.h3_keepalive_secs);
-        assert_eq!(stealth.wg_keepalive_secs, 25);
     }
 
     #[test]
@@ -174,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mode_gets_no_synthetic_policy() {
+    fn unknown_mode_gets_no_scan_specific_policy() {
         assert_eq!(defaults_for_scan("custom"), None);
     }
 }

@@ -1,5 +1,7 @@
 use std::env;
 
+mod adaptive;
+
 const USAGE: &str = "\
 Aether — a censorship circumvention client. It finds a way out of a filtered
 network, opens an encrypted tunnel, and serves it as a local SOCKS5 proxy.
@@ -131,7 +133,7 @@ Advanced:
   --verbose                shortcut for --log-level debug (RUST_LOG overrides both)
 
   -v, --version            show version and exit
-  -h, --help, help         show this help and exit
+  -h, --help, help         show this text
 
 Environment variables:
   Every flag above has one, for scripts and services. The last few have no flag
@@ -335,6 +337,7 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<()> {
         i += 1;
     }
 
+    adaptive::apply_for_configured_scan();
     Ok(())
 }
 

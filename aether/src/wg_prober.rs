@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
@@ -110,6 +111,97 @@ impl WgScanMode {
 }
 
 const WG_IRONCLAD_TCPING_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_ENDPOINT_COOLDOWN_SECS: u64 = 300;
+
+// `run_gool` only asks this prober for a new hop pair after the previous pair
+// has been cleared for a rescan (normally after repeated tunnel failures). Keep
+// the last selected addresses here so entering the *next* WiW scan moves them
+// into a real cooldown window. Starting the cooldown on rescan instead of on
+// successful selection means a pair that worked for hours is still excluded
+// after it later fails twice.
+static WIW_LAST_SELECTION: OnceLock<Mutex<HashSet<IpAddr>>> = OnceLock::new();
+static WIW_COOLDOWNS: OnceLock<Mutex<HashMap<IpAddr, Instant>>> = OnceLock::new();
+
+fn wiw_last_selection() -> &'static Mutex<HashSet<IpAddr>> {
+    WIW_LAST_SELECTION.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn wiw_cooldowns() -> &'static Mutex<HashMap<IpAddr, Instant>> {
+    WIW_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn endpoint_cooldown() -> Duration {
+    let secs = std::env::var("AETHER_WG_ENDPOINT_COOLDOWN_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ENDPOINT_COOLDOWN_SECS);
+    Duration::from_secs(secs)
+}
+
+fn is_wiw_scan(want: usize) -> bool {
+    let protocol = std::env::var("AETHER_PROTOCOL")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    matches!(
+        protocol.as_deref(),
+        Some("gool" | "wiw" | "warp-in-warp" | "warpinwarp")
+    ) || want > 1
+        || std::env::var("AETHER_WIW_OUTER_PEER").is_ok()
+        || std::env::var("AETHER_WIW_INNER_PEER").is_ok()
+        || std::env::var("AETHER_WIW_PEERS").is_ok()
+}
+
+fn add_ip_exclusions(
+    excluded: &mut HashSet<SocketAddr>,
+    ips: impl IntoIterator<Item = IpAddr>,
+    ports: &[u16],
+) {
+    for ip in ips {
+        for port in ports {
+            excluded.insert(SocketAddr::new(ip, *port));
+        }
+    }
+}
+
+fn exclusions_for_scan(probe: &WgProbe, wiw: bool) -> HashSet<SocketAddr> {
+    let mut excluded = probe.excluded.clone();
+    if !wiw {
+        return excluded;
+    }
+
+    let now = Instant::now();
+    let cooldown = endpoint_cooldown();
+    let previous: Vec<IpAddr> = wiw_last_selection().lock().drain().collect();
+    let mut cooling = wiw_cooldowns().lock();
+    cooling.retain(|_, until| *until > now);
+
+    if !previous.is_empty() {
+        let until = now + cooldown;
+        for ip in &previous {
+            cooling.insert(*ip, until);
+        }
+        log::warn!(
+            "[-] previous WARP-in-WARP hop set moved into {:?} cooldown before rescan",
+            cooldown
+        );
+    }
+
+    let active: Vec<IpAddr> = cooling.keys().copied().collect();
+    drop(cooling);
+    add_ip_exclusions(&mut excluded, active, &probe.ports);
+    excluded
+}
+
+fn remember_wiw_selection(selected: &[WgProbeResult], original_excluded: &HashSet<SocketAddr>) {
+    let mut remembered = HashSet::new();
+    remembered.extend(selected.iter().map(|result| result.ip));
+    // A one-hop scan means the other WiW hop was already known and therefore
+    // expanded into `original_excluded` by select_wg_peers. Remember its IP too
+    // so a later rescan rotates the whole failed pair, not just the scanned hop.
+    remembered.extend(original_excluded.iter().map(SocketAddr::ip));
+    *wiw_last_selection().lock() = remembered;
+}
 
 struct WgStrategy {
     concurrency: usize,
@@ -149,6 +241,7 @@ pub async fn hunt_wg_endpoints(
     want: usize,
 ) -> Result<Vec<WgProbeResult>> {
     let want = want.max(1);
+    let wiw = is_wiw_scan(want);
     let mut st = mode.strategy();
     st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
     let timeout = st.per_probe_timeout;
@@ -162,7 +255,8 @@ pub async fn hunt_wg_endpoints(
             return Err(AetherError::NoCleanEndpoint);
         }
     }
-    let candidates = build_wg_candidates(&st, &probe.ports, effective_ip, &probe.excluded);
+    let excluded = exclusions_for_scan(probe, wiw);
+    let candidates = build_wg_candidates(&st, &probe.ports, effective_ip, &excluded);
 
     log::info!(
         "[*] wireguard scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?}",
@@ -222,6 +316,9 @@ pub async fn hunt_wg_endpoints(
                     Some(Some(pr)) => {
                         log::info!("[+] wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
                         if st.early_exit_first {
+                            if wiw {
+                                remember_wiw_selection(&[pr], &probe.excluded);
+                            }
                             return Ok(vec![pr]);
                         }
                         verified.push(pr);
@@ -263,11 +360,15 @@ pub async fn hunt_wg_endpoints(
         return Err(AetherError::NoCleanEndpoint);
     }
 
-    for pr in picked.iter().take(want) {
+    let selected: Vec<WgProbeResult> = picked.into_iter().take(want).collect();
+    for pr in &selected {
         log::info!("[+] wg endpoint {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
     }
+    if wiw {
+        remember_wiw_selection(&selected, &probe.excluded);
+    }
 
-    Ok(picked.into_iter().take(want).collect())
+    Ok(selected)
 }
 
 fn distinct_by_ip(found: &[WgProbeResult]) -> Vec<WgProbeResult> {
@@ -689,5 +790,15 @@ mod tests {
         );
 
         assert!(!candidates.contains(&(peer.ip(), peer.port())));
+    }
+
+    #[test]
+    fn ip_cooldown_expands_across_all_wireguard_ports() {
+        let ip: IpAddr = "162.159.192.1".parse().unwrap();
+        let mut excluded = HashSet::new();
+        add_ip_exclusions(&mut excluded, [ip], &[2408, 500, 1701]);
+        assert!(excluded.contains(&"162.159.192.1:2408".parse().unwrap()));
+        assert!(excluded.contains(&"162.159.192.1:500".parse().unwrap()));
+        assert!(excluded.contains(&"162.159.192.1:1701".parse().unwrap()));
     }
 }

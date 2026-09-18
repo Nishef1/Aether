@@ -1,0 +1,45 @@
+name: migration-preflight
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [aether-v2-custom-migration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aether-v2-migration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aether
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang perl pkg-config
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Default tests
+        run: cargo test --all-targets
+
+      - name: Tor feature compile
+        run: cargo check --features tor --all-targets

@@ -1,5 +1,7 @@
 use std::env;
 
+mod adaptive;
+
 const USAGE: &str = "\
 Aether — a censorship circumvention client. It finds a way out of a filtered
 network, opens an encrypted tunnel, and serves it as a local SOCKS5 proxy.
@@ -447,6 +449,7 @@ pub fn parse_args(args: Vec<String>) -> crate::error::Result<Parsed> {
         i += 1;
     }
 
+    adaptive::apply_for_configured_scan();
     Ok(Parsed::Run)
 }
 

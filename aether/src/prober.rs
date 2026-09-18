@@ -448,6 +448,25 @@ async fn verify_one(
     }
 }
 
+fn interleave_ip_families(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>, ip: IpScan) -> Vec<IpAddr> {
+    match ip {
+        IpScan::V4 => v4.into_iter().map(IpAddr::V4).collect(),
+        IpScan::V6 => v6.into_iter().map(IpAddr::V6).collect(),
+        IpScan::Both => {
+            let mut out = Vec::with_capacity(v4.len() + v6.len());
+            for index in 0..v4.len().max(v6.len()) {
+                if let Some(addr) = v4.get(index) {
+                    out.push(IpAddr::V4(*addr));
+                }
+                if let Some(addr) = v6.get(index) {
+                    out.push(IpAddr::V6(*addr));
+                }
+            }
+            out
+        }
+    }
+}
+
 fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
     let primary = ports.first().copied().unwrap_or(443);
     let mut out: Vec<(IpAddr, u16)> = Vec::new();
@@ -459,12 +478,9 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         .filter_map(|s| s.parse().ok())
         .collect();
 
+    let mut primary4 = Vec::new();
     if ip.want_v4() {
-        for a in &seeds {
-            if seen.insert((IpAddr::V4(*a), primary)) {
-                out.push((IpAddr::V4(*a), primary));
-            }
-        }
+        primary4.extend(seeds.iter().copied());
         let cidr_hosts: Vec<Vec<Ipv4Addr>> = masque_cidrs_v4()
             .iter()
             .map(|c| {
@@ -479,20 +495,15 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         for i in 0..max_len {
             for hosts in &cidr_hosts {
                 if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V4(*a), primary)) {
-                        out.push((IpAddr::V4(*a), primary));
-                    }
+                    primary4.push(*a);
                 }
             }
         }
     }
 
+    let mut primary6 = Vec::new();
     if ip.want_v6() {
-        for a in &seeds6 {
-            if seen.insert((IpAddr::V6(*a), primary)) {
-                out.push((IpAddr::V6(*a), primary));
-            }
-        }
+        primary6.extend(seeds6.iter().copied());
         let per = if st.sample_per_cidr == 0 {
             96
         } else {
@@ -506,14 +517,19 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         for i in 0..max6 {
             for hosts in &cidr6 {
                 if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V6(*a), primary)) {
-                        out.push((IpAddr::V6(*a), primary));
-                    }
+                    primary6.push(*a);
                 }
             }
         }
     }
 
+    for address in interleave_ip_families(primary4, primary6, ip) {
+        if seen.insert((address, primary)) {
+            out.push((address, primary));
+        }
+    }
+
+    // Preserve v2's complete alternate-port coverage for seed anchors.
     if ip.want_v4() {
         for a in &seeds {
             for &port in ports {
@@ -634,6 +650,17 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dual_stack_scan_head_interleaves_ipv4_and_ipv6() {
+        let strategy = ScanMode::Turbo.strategy();
+        let candidates = build_candidates(&strategy, &[443], IpScan::Both);
+        assert!(candidates.len() >= 4);
+        assert!(candidates[0].0.is_ipv4());
+        assert!(candidates[1].0.is_ipv6());
+        assert!(candidates[2].0.is_ipv4());
+        assert!(candidates[3].0.is_ipv6());
+    }
 
     #[test]
     fn the_documented_zero_trust_masque_ingress_range_is_scanned() {

@@ -1,0 +1,141 @@
+use std::env;
+
+const DEFAULT_WG_KEEPALIVE_SECS: u16 = 25;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdaptiveNetworkDefaults {
+    masque_startup_secs: u16,
+    h2_keepalive_secs: u16,
+    h2_keepalive_timeout_secs: u16,
+    h3_keepalive_secs: u16,
+    wg_stale_secs: u16,
+    wg_endpoint_cooldown_secs: u16,
+}
+
+fn defaults_for_scan(mode: &str) -> Option<AdaptiveNetworkDefaults> {
+    let defaults = match mode.trim().to_ascii_lowercase().as_str() {
+        "turbo" => AdaptiveNetworkDefaults {
+            masque_startup_secs: 20,
+            h2_keepalive_secs: 10,
+            h2_keepalive_timeout_secs: 15,
+            h3_keepalive_secs: 20,
+            wg_stale_secs: 10,
+            wg_endpoint_cooldown_secs: 180,
+        },
+        "balanced" => AdaptiveNetworkDefaults {
+            masque_startup_secs: 30,
+            h2_keepalive_secs: 15,
+            h2_keepalive_timeout_secs: 20,
+            h3_keepalive_secs: 20,
+            wg_stale_secs: 12,
+            wg_endpoint_cooldown_secs: 300,
+        },
+        "thorough" => AdaptiveNetworkDefaults {
+            masque_startup_secs: 45,
+            h2_keepalive_secs: 15,
+            h2_keepalive_timeout_secs: 25,
+            h3_keepalive_secs: 20,
+            wg_stale_secs: 18,
+            wg_endpoint_cooldown_secs: 120,
+        },
+        "stealth" => AdaptiveNetworkDefaults {
+            masque_startup_secs: 60,
+            h2_keepalive_secs: 25,
+            h2_keepalive_timeout_secs: 35,
+            h3_keepalive_secs: 30,
+            wg_stale_secs: 25,
+            wg_endpoint_cooldown_secs: 600,
+        },
+        "ironclad" => AdaptiveNetworkDefaults {
+            masque_startup_secs: 45,
+            h2_keepalive_secs: 15,
+            h2_keepalive_timeout_secs: 20,
+            h3_keepalive_secs: 20,
+            wg_stale_secs: 15,
+            wg_endpoint_cooldown_secs: 300,
+        },
+        _ => return None,
+    };
+    Some(defaults)
+}
+
+fn set_default(key: &str, value: impl ToString) {
+    match env::var(key) {
+        Ok(existing) if !existing.trim().is_empty() => return,
+        Err(env::VarError::NotUnicode(_)) => return,
+        _ => {}
+    }
+    env::set_var(key, value.to_string());
+}
+
+/// Apply runtime policy after CLI parsing. Explicit values always win.
+pub(super) fn apply_for_configured_scan() {
+    set_default("AETHER_WG_KEEPALIVE", DEFAULT_WG_KEEPALIVE_SECS);
+
+    let Ok(mode) = env::var("AETHER_SCAN") else {
+        return;
+    };
+    let Some(defaults) = defaults_for_scan(&mode) else {
+        return;
+    };
+
+    set_default("AETHER_MASQUE_STARTUP_SECS", defaults.masque_startup_secs);
+    set_default(
+        "AETHER_MASQUE_H2_KEEPALIVE_SECS",
+        defaults.h2_keepalive_secs,
+    );
+    set_default(
+        "AETHER_MASQUE_H2_KEEPALIVE_TIMEOUT_SECS",
+        defaults.h2_keepalive_timeout_secs,
+    );
+    set_default(
+        "AETHER_MASQUE_H3_KEEPALIVE_SECS",
+        defaults.h3_keepalive_secs,
+    );
+    set_default("AETHER_WG_STALE_SECS", defaults.wg_stale_secs);
+    set_default(
+        "AETHER_WG_ENDPOINT_COOLDOWN_SECS",
+        defaults.wg_endpoint_cooldown_secs,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wireguard_idle_keepalive_has_one_transport_wide_default() {
+        assert_eq!(DEFAULT_WG_KEEPALIVE_SECS, 25);
+    }
+
+    #[test]
+    fn turbo_is_the_fail_fast_policy() {
+        let turbo = defaults_for_scan("turbo").unwrap();
+        let balanced = defaults_for_scan("balanced").unwrap();
+        assert!(turbo.masque_startup_secs < balanced.masque_startup_secs);
+        assert!(turbo.h2_keepalive_secs < balanced.h2_keepalive_secs);
+    }
+
+    #[test]
+    fn stealth_reduces_liveness_and_reconnect_churn() {
+        let stealth = defaults_for_scan("STEALTH").unwrap();
+        let balanced = defaults_for_scan("balanced").unwrap();
+        assert!(stealth.wg_stale_secs > balanced.wg_stale_secs);
+        assert!(stealth.wg_endpoint_cooldown_secs > balanced.wg_endpoint_cooldown_secs);
+        assert!(stealth.h2_keepalive_timeout_secs > stealth.h2_keepalive_secs);
+        assert!(stealth.h3_keepalive_secs > balanced.h3_keepalive_secs);
+    }
+
+    #[test]
+    fn thorough_keeps_candidate_pool_recoverable() {
+        let thorough = defaults_for_scan(" thorough ").unwrap();
+        let balanced = defaults_for_scan("balanced").unwrap();
+        assert!(thorough.masque_startup_secs > balanced.masque_startup_secs);
+        assert!(thorough.wg_endpoint_cooldown_secs < balanced.wg_endpoint_cooldown_secs);
+    }
+
+    #[test]
+    fn unknown_mode_gets_no_scan_specific_policy() {
+        assert_eq!(defaults_for_scan("custom"), None);
+    }
+}

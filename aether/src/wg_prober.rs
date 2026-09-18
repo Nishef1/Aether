@@ -564,8 +564,7 @@ mod tests {
     #[test]
     fn dual_stack_scan_head_interleaves_anchor_families() {
         let strategy = WgScanMode::Turbo.strategy();
-        let candidates =
-            build_wg_candidates(&strategy, &[2408], IpScan::Both, &HashSet::new());
+        let candidates = build_wg_candidates(&strategy, &[2408], IpScan::Both, &HashSet::new());
         assert!(candidates.len() >= 4);
         assert!(candidates[0].0.is_ipv4());
         assert!(candidates[1].0.is_ipv6());
